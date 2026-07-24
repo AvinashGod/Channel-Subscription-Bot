@@ -150,6 +150,7 @@ def admin_panel(message):
     markup.add(InlineKeyboardButton("📊 Stats", callback_data="adm_stats"))
     markup.add(InlineKeyboardButton("👥 Active Subscribers", callback_data="adm_active"))
     markup.add(InlineKeyboardButton("🎁 Manually Grant Access", callback_data="adm_grant"))
+    markup.add(InlineKeyboardButton("🚫 Remove Membership", callback_data="adm_remove"))
     markup.add(InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast"))
     markup.add(InlineKeyboardButton("📋 Manage Channels", callback_data="adm_channels"))
     bot.send_message(message.chat.id, "🛠 *Admin Panel*\n\nChoose an option:", reply_markup=markup, parse_mode="Markdown")
@@ -269,6 +270,44 @@ def process_grant(message, ch_id):
         bot.send_message(ADMIN_ID, f"✅ Granted user {target_id} {mins} mins access manually.")
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Error granting access: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_remove")
+def adm_remove(call):
+    bot.answer_callback_query(call.id)
+    markup = InlineKeyboardMarkup()
+    cursor = channels_col.find({"admin_id": ADMIN_ID})
+    count = 0
+    for ch in cursor:
+        markup.add(InlineKeyboardButton(f"{ch['name']}", callback_data=f"removech_{ch['channel_id']}"))
+        count += 1
+    if count == 0:
+        bot.send_message(call.message.chat.id, "No channels found.")
+        return
+    bot.send_message(call.message.chat.id, "🚫 Which channel do you want to remove a member from?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('removech_'))
+def removech(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    msg = bot.send_message(call.message.chat.id, "Send the Telegram user ID to remove from this channel.")
+    bot.register_next_step_handler(msg, process_remove, ch_id)
+
+def process_remove(message, ch_id):
+    try:
+        target_id = int(message.text.strip())
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid user ID. Try /admin again to retry.")
+        return
+
+    try:
+        bot.ban_chat_member(ch_id, target_id)
+        bot.unban_chat_member(ch_id, target_id)
+        users_col.delete_one({"user_id": target_id, "channel_id": ch_id})
+        bot.send_message(target_id, "⚠️ Your membership has been removed by the admin.")
+        bot.send_message(ADMIN_ID, f"🚫 Removed user {target_id} from channel.")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Error removing member: {e}\n\n(Note removed from database anyway if they were tracked.)")
+        users_col.delete_one({"user_id": target_id, "channel_id": ch_id})
 
 # --- USER: PAYMENT FLOW ---
 
