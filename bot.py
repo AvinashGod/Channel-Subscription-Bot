@@ -40,6 +40,20 @@ pending_payments = {}
 
 # --- ADMIN LOGIC ---
 
+def show_plans(chat_id, ch_id):
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    if not ch_data:
+        return
+    markup = InlineKeyboardMarkup()
+    for p_time, p_price in ch_data['plans'].items():
+        label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
+        markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
+
+    markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
+    bot.send_message(chat_id,
+        f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:",
+        reply_markup=markup, parse_mode="Markdown")
+
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
@@ -50,22 +64,31 @@ def start_handler(message):
             ch_id = int(text[1])
             ch_data = channels_col.find_one({"channel_id": ch_id})
             if ch_data:
-                markup = InlineKeyboardMarkup()
-                for p_time, p_price in ch_data['plans'].items():
-                    label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
-                    markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
-                
-                markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-                bot.send_message(message.chat.id, 
-                    f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:", 
-                    reply_markup=markup, parse_mode="Markdown")
+                show_plans(message.chat.id, ch_id)
                 return
         except: pass
 
     if user_id == ADMIN_ID:
         bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
     else:
-        bot.send_message(message.chat.id, "Welcome! To join a channel, please use the link provided by the Admin.")
+        markup = InlineKeyboardMarkup()
+        cursor = channels_col.find({})
+        count = 0
+        for ch in cursor:
+            markup.add(InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"viewch_{ch['channel_id']}"))
+            count += 1
+        markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
+
+        if count == 0:
+            bot.send_message(message.chat.id, "Welcome! No channels are available for subscription right now. Please check back later.")
+        else:
+            bot.send_message(message.chat.id, "Welcome! 👋\n\nHere are the channels available for subscription:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('viewch_'))
+def view_channel(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    show_plans(call.message.chat.id, ch_id)
 
 @bot.message_handler(commands=['channels'], func=lambda m: m.from_user.id == ADMIN_ID)
 def list_channels(message):
@@ -209,8 +232,38 @@ def manage_ch(call):
     ch_data = channels_col.find_one({"channel_id": ch_id})
     bot_username = bot.get_me().username
     link = f"https://t.me/{bot_username}?start={ch_id}"
-    
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🗑 Delete Channel", callback_data=f"delch_{ch_id}"))
+
     bot.edit_message_text(f"Settings for: *{ch_data['name']}*\n\nYour Link: `{link}`\n\nTo edit prices, use /add and forward a message from this channel again.", 
+                          call.message.chat.id, call.message.message_id, parse_mode="Markdown",
+                          reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delch_'))
+def confirm_delete_channel(call):
+    ch_id = int(call.data.split('_')[1])
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    if not ch_data:
+        bot.answer_callback_query(call.id, "Channel not found.")
+        return
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Yes, Delete It", callback_data=f"confirmdel_{ch_id}"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"manage_{ch_id}"))
+
+    bot.edit_message_text(f"⚠️ Are you sure you want to delete *{ch_data['name']}*?\n\nThis removes it from your channel list and from the /start menu. Existing subscribers already in the channel will NOT be auto-kicked by this action — only new signups stop.",
+                          call.message.chat.id, call.message.message_id, parse_mode="Markdown",
+                          reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('confirmdel_'))
+def do_delete_channel(call):
+    ch_id = int(call.data.split('_')[1])
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    name = ch_data['name'] if ch_data else str(ch_id)
+
+    channels_col.delete_one({"channel_id": ch_id})
+    bot.edit_message_text(f"🗑 Deleted *{name}*.\n\nUse /channels to see your remaining channels.",
                           call.message.chat.id, call.message.message_id, parse_mode="Markdown")
 
 # Automate Kicking
