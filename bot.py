@@ -1,4 +1,5 @@
 import os
+import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pymongo import MongoClient
@@ -25,12 +26,17 @@ MONGO_URI = os.getenv('MONGO_URI')
 ADMIN_ID = int(os.getenv('ADMIN_ID'))
 UPI_ID = os.getenv('UPI_ID')
 CONTACT_USERNAME = os.getenv('CONTACT_USERNAME')
+BHARATPE_TOKEN = os.getenv('BHARATPE_TOKEN')
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = MongoClient(MONGO_URI)
 db = client['sub_management']
 channels_col = db['channels']
 users_col = db['users']
+used_utrs_col = db['used_utrs']  # permanent record of spent UTRs, never touched by kick_expired_users
+
+# In-memory tracker: user_id -> {"ch_id":.., "mins":.., "price":..}
+pending_payments = {}
 
 # --- ADMIN LOGIC ---
 
@@ -39,14 +45,12 @@ def start_handler(message):
     user_id = message.from_user.id
     text = message.text.split()
 
-    # User entry via Deep Link
     if len(text) > 1:
         try:
             ch_id = int(text[1])
             ch_data = channels_col.find_one({"channel_id": ch_id})
             if ch_data:
                 markup = InlineKeyboardMarkup()
-                # Display Dynamic Plans
                 for p_time, p_price in ch_data['plans'].items():
                     label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
                     markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
@@ -58,7 +62,6 @@ def start_handler(message):
                 return
         except: pass
 
-    # Admin Panel Greeting
     if user_id == ADMIN_ID:
         bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
     else:
@@ -67,7 +70,6 @@ def start_handler(message):
 @bot.message_handler(commands=['channels'], func=lambda m: m.from_user.id == ADMIN_ID)
 def list_channels(message):
     markup = InlineKeyboardMarkup()
-    # Fetch all channels managed by this admin
     cursor = channels_col.find({"admin_id": ADMIN_ID})
     count = 0
     for ch in cursor:
@@ -86,7 +88,6 @@ def add_channel_start(message):
     msg = bot.send_message(ADMIN_ID, "Please ensure the bot is an Admin in your channel, then FORWARD any message from that channel here.")
     bot.register_next_step_handler(msg, get_plans)
 
-# Callback for Add New button
 @bot.callback_query_handler(func=lambda call: call.data == "add_new")
 def cb_add_new(call):
     bot.answer_callback_query(call.id)
@@ -136,54 +137,71 @@ def user_pays(call):
                    caption=f"Plan: {mins} Minutes\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.", 
                    reply_markup=markup, parse_mode="Markdown")
 
+    pending_payments[call.from_user.id] = {"ch_id": int(ch_id), "mins": mins, "price": int(price)}
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
-def admin_notify(call):
-    _, ch_id, mins = call.data.split('_')
-    user = call.from_user
-    ch_data = channels_col.find_one({"channel_id": int(ch_id)})
-    price = ch_data['plans'][mins]
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✅ Approve", callback_data=f"app_{user.id}_{ch_id}_{mins}"))
-    markup.add(InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user.id}"))
-    
-    bot.send_message(ADMIN_ID, f"🔔 *Payment Verification Required!*\n\nUser: {user.first_name}\nChannel: {ch_data['name']}\nPlan: {mins} Mins\nPrice: ₹{price}", 
-                     reply_markup=markup, parse_mode="Markdown")
-    
-    u_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-    bot.send_message(call.message.chat.id, "✅ Your payment request has been sent. Please wait for Admin approval.", reply_markup=u_markup)
+def ask_for_utr(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,
+                      "🧾 Please send your 12-digit UTR / transaction reference number now to verify your payment.")
 
-# --- APPROVAL & EXPIRY ---
+# --- BHARATPE UTR AUTO-VERIFICATION ---
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('app_'))
-def approve_now(call):
-    _, u_id, ch_id, mins = call.data.split('_')
-    u_id, ch_id, mins = int(u_id), int(ch_id), int(mins)
-    
+@bot.message_handler(func=lambda msg: msg.from_user.id in pending_payments and msg.text and msg.text.strip().isdigit())
+def verify_utr(msg):
+    user_id = msg.from_user.id
+    utr = msg.text.strip()
+    plan = pending_payments.get(user_id)
+    if not plan:
+        return
+
+    if used_utrs_col.find_one({"utr": utr}):
+        bot.reply_to(msg, "⚠️ This UTR has already been used for a previous approval.")
+        return
+
+    try:
+        resp = requests.get(
+            "https://bharatpe-payment-checker.vercel.app/check",
+            params={"token": BHARATPE_TOKEN, "utr": utr},
+            timeout=10
+        )
+        data = resp.json()
+    except Exception as e:
+        bot.reply_to(msg, "⚠️ Verification service unavailable right now. Please try again in a minute, or contact admin.")
+        bot.send_message(ADMIN_ID, f"UTR check failed for user {user_id}, utr {utr}: {e}")
+        return
+
+    if not data.get("success"):
+        bot.reply_to(msg, f"❌ {data.get('message', 'UTR not found yet. Wait a minute and resend, or contact admin.')}")
+        return
+
+    paid_amount = data["data"]["amount"]
+    if int(paid_amount) != int(plan["price"]):
+        bot.reply_to(msg, f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{plan['price']}. Contact admin.")
+        bot.send_message(ADMIN_ID, f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{plan['price']}, utr {utr}")
+        return
+
+    ch_id, mins = plan["ch_id"], int(plan["mins"])
     try:
         expiry_datetime = datetime.now() + timedelta(minutes=mins)
         expiry_ts = int(expiry_datetime.timestamp())
 
-        # Link expires when sub ends
         link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
-        
-        users_col.update_one({"user_id": u_id, "channel_id": ch_id}, {"$set": {"expiry": expiry_datetime.timestamp()}}, upsert=True)
-        
-        bot.send_message(u_id, f"🥳 *Payment Approved!*\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes.", parse_mode="Markdown")
-        bot.edit_message_text(f"✅ Approved user {u_id} for {mins} mins.", call.message.chat.id, call.message.message_id)
-        
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Error: {e}")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('rej_'))
-def reject_now(call):
-    _, u_id = call.data.split('_')
-    u_id = int(u_id)
-    try:
-        bot.send_message(u_id, "❌ Your payment could not be verified. Please contact admin if you believe this is a mistake.")
-        bot.edit_message_text(f"❌ Rejected payment for user {u_id}.", call.message.chat.id, call.message.message_id)
+        users_col.update_one(
+            {"user_id": user_id, "channel_id": ch_id},
+            {"$set": {"expiry": expiry_datetime.timestamp()}},
+            upsert=True
+        )
+        used_utrs_col.insert_one({"utr": utr, "user_id": user_id, "ch_id": ch_id, "amount": paid_amount, "used_at": datetime.now()})
+
+        bot.send_message(user_id,
+                          f"🎉 <b>Payment Verified!</b>\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes.",
+                          parse_mode="HTML")
+        bot.send_message(ADMIN_ID, f"✅ Auto-approved user {user_id} for {mins} mins via UTR {utr} (₹{paid_amount}).")
+        del pending_payments[user_id]
     except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Error: {e}")
+        bot.send_message(ADMIN_ID, f"❌ Error during auto-approval: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('manage_'))
 def manage_ch(call):
@@ -213,11 +231,30 @@ def kick_expired_users():
             users_col.delete_one({"_id": user['_id']})
         except: pass
 
+# Daily summary of auto-approvals so the admin can eyeball activity
+def daily_summary():
+    since = datetime.now() - timedelta(hours=24)
+    approvals = list(used_utrs_col.find({"used_at": {"$gte": since}}))
+
+    if not approvals:
+        bot.send_message(ADMIN_ID, "📊 *Daily Summary*\n\nNo approvals in the last 24 hours.", parse_mode="Markdown")
+        return
+
+    total_amount = sum(a.get("amount", 0) for a in approvals)
+    lines = [f"📊 *Daily Summary — Last 24 Hours*\n\nTotal approvals: {len(approvals)}\nTotal collected: ₹{total_amount}\n"]
+    for a in approvals[:20]:  # cap the list so it doesn't get huge
+        lines.append(f"• User {a['user_id']} — ₹{a.get('amount', '?')} — UTR {a['utr']} — {a['used_at'].strftime('%H:%M')}")
+    if len(approvals) > 20:
+        lines.append(f"... and {len(approvals) - 20} more")
+
+    bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="Markdown")
+
 # --- STARTUP ---
 if __name__ == '__main__':
     keep_alive()
     scheduler = BackgroundScheduler()
     scheduler.add_job(kick_expired_users, 'interval', minutes=1)
+    scheduler.add_job(daily_summary, 'cron', hour=23, minute=59)
     scheduler.start()
     bot.remove_webhook()
     print("Bot is running...")
