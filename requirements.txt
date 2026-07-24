@@ -2,3 +2,4 @@ pyTelegramBotAPI
 pymongo[srv]
 apscheduler
 flask
+requests
