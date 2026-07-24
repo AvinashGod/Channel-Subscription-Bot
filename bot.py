@@ -69,7 +69,7 @@ def start_handler(message):
         except: pass
 
     if user_id == ADMIN_ID:
-        bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
+        bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/admin - Open Admin Panel\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
     else:
         markup = InlineKeyboardMarkup()
         cursor = channels_col.find({})
@@ -141,6 +141,134 @@ def finalize_channel(message, ch_id, ch_name):
         bot.send_message(ADMIN_ID, f"✅ Setup Successful!\n\nInvite Link for users:\n`https://t.me/{bot_username}?start={ch_id}`", parse_mode="Markdown")
     except:
         bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price, Min:Price`. Use /add to retry.")
+
+# --- ADMIN PANEL ---
+
+@bot.message_handler(commands=['admin'], func=lambda m: m.from_user.id == ADMIN_ID)
+def admin_panel(message):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📊 Stats", callback_data="adm_stats"))
+    markup.add(InlineKeyboardButton("👥 Active Subscribers", callback_data="adm_active"))
+    markup.add(InlineKeyboardButton("🎁 Manually Grant Access", callback_data="adm_grant"))
+    markup.add(InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast"))
+    markup.add(InlineKeyboardButton("📋 Manage Channels", callback_data="adm_channels"))
+    bot.send_message(message.chat.id, "🛠 *Admin Panel*\n\nChoose an option:", reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_stats")
+def adm_stats(call):
+    bot.answer_callback_query(call.id)
+    total_channels = channels_col.count_documents({"admin_id": ADMIN_ID})
+    active_subs = users_col.count_documents({"expiry": {"$gt": datetime.now().timestamp()}})
+    total_approvals = used_utrs_col.count_documents({})
+    total_revenue = sum(a.get("amount", 0) for a in used_utrs_col.find({}))
+
+    since = datetime.now() - timedelta(hours=24)
+    today_approvals = list(used_utrs_col.find({"used_at": {"$gte": since}}))
+    today_revenue = sum(a.get("amount", 0) for a in today_approvals)
+
+    bot.send_message(call.message.chat.id,
+        f"📊 *Bot Stats*\n\n"
+        f"Channels: {total_channels}\n"
+        f"Active subscribers: {active_subs}\n\n"
+        f"*All-time*\nApprovals: {total_approvals}\nRevenue: ₹{total_revenue}\n\n"
+        f"*Last 24 hours*\nApprovals: {len(today_approvals)}\nRevenue: ₹{today_revenue}",
+        parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_active")
+def adm_active(call):
+    bot.answer_callback_query(call.id)
+    now = datetime.now().timestamp()
+    active = list(users_col.find({"expiry": {"$gt": now}}).sort("expiry", 1))
+
+    if not active:
+        bot.send_message(call.message.chat.id, "No active subscribers right now.")
+        return
+
+    lines = [f"👥 *Active Subscribers* ({len(active)})\n"]
+    for u in active[:25]:
+        ch_data = channels_col.find_one({"channel_id": u['channel_id']})
+        ch_name = ch_data['name'] if ch_data else str(u['channel_id'])
+        remaining_min = int((u['expiry'] - now) / 60)
+        lines.append(f"• User {u['user_id']} — {ch_name} — expires in {remaining_min} min")
+    if len(active) > 25:
+        lines.append(f"... and {len(active) - 25} more")
+
+    bot.send_message(call.message.chat.id, "\n".join(lines), parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_channels")
+def adm_channels(call):
+    bot.answer_callback_query(call.id)
+    list_channels(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_broadcast")
+def adm_broadcast(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id, "📢 Send the message you want to broadcast to all active subscribers.\n\nSend /cancel to abort.")
+    bot.register_next_step_handler(msg, do_broadcast)
+
+def do_broadcast(message):
+    if message.text and message.text.strip() == "/cancel":
+        bot.send_message(ADMIN_ID, "Broadcast cancelled.")
+        return
+
+    recipients = users_col.distinct("user_id")
+    sent, failed = 0, 0
+    for uid in recipients:
+        try:
+            bot.send_message(uid, message.text)
+            sent += 1
+        except Exception:
+            failed += 1
+    bot.send_message(ADMIN_ID, f"📢 Broadcast complete.\n\nSent: {sent}\nFailed (blocked/inactive): {failed}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_grant")
+def adm_grant(call):
+    bot.answer_callback_query(call.id)
+    markup = InlineKeyboardMarkup()
+    cursor = channels_col.find({"admin_id": ADMIN_ID})
+    count = 0
+    for ch in cursor:
+        markup.add(InlineKeyboardButton(f"{ch['name']}", callback_data=f"grantch_{ch['channel_id']}"))
+        count += 1
+    if count == 0:
+        bot.send_message(call.message.chat.id, "No channels found. Add one first with /add.")
+        return
+    bot.send_message(call.message.chat.id, "🎁 Which channel do you want to grant access to?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('grantch_'))
+def grantch(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    msg = bot.send_message(call.message.chat.id,
+        "Send the user's Telegram ID and duration in minutes, separated by a space.\n\nExample: `123456789 1440` (grants that user 1440 minutes / 1 day)",
+        parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_grant, ch_id)
+
+def process_grant(message, ch_id):
+    try:
+        parts = message.text.strip().split()
+        target_id, mins = int(parts[0]), int(parts[1])
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid format. Use: `user_id minutes` — e.g. `123456789 1440`. Try /admin again to retry.", parse_mode="Markdown")
+        return
+
+    try:
+        expiry_datetime = datetime.now() + timedelta(minutes=mins)
+        expiry_ts = int(expiry_datetime.timestamp())
+        link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
+
+        users_col.update_one(
+            {"user_id": target_id, "channel_id": ch_id},
+            {"$set": {"expiry": expiry_datetime.timestamp()}},
+            upsert=True
+        )
+
+        bot.send_message(target_id,
+            f"🎁 <b>Access Granted by Admin!</b>\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes.",
+            parse_mode="HTML")
+        bot.send_message(ADMIN_ID, f"✅ Granted user {target_id} {mins} mins access manually.")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Error granting access: {e}")
 
 # --- USER: PAYMENT FLOW ---
 
