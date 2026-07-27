@@ -436,20 +436,25 @@ def do_delete_channel(call):
 # Automate Kicking
 def kick_expired_users():
     now = datetime.now().timestamp()
-    expired_users = users_col.find({"expiry": {"$lte": now}})
+    expired_users = list(users_col.find({"expiry": {"$lte": now}}))
     bot_username = bot.get_me().username
 
     for user in expired_users:
         try:
             bot.ban_chat_member(user['channel_id'], user['user_id'])
             bot.unban_chat_member(user['channel_id'], user['user_id'])
-            
+        except Exception:
+            pass  # e.g. already left the channel — safe to ignore, still clean up below
+
+        # Always remove the expired record, even if the user has blocked the bot
+        users_col.delete_one({"_id": user['_id']})
+
+        try:
             rejoin_url = f"https://t.me/{bot_username}?start={user['channel_id']}"
             markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🔄 Re-join / Renew", url=rejoin_url))
-            
             bot.send_message(user['user_id'], "⚠️ Your subscription has expired.\n\nTo join again or renew, please click the button below:", reply_markup=markup)
-            users_col.delete_one({"_id": user['_id']})
-        except: pass
+        except Exception:
+            pass  # user may have blocked the bot — cleanup above already happened regardless
 
 # Daily summary of auto-approvals so the admin can eyeball activity
 def daily_summary():
