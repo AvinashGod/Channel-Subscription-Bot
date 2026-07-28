@@ -27,6 +27,7 @@ ADMIN_ID = int(os.getenv('ADMIN_ID'))
 UPI_ID = os.getenv('UPI_ID')
 CONTACT_USERNAME = os.getenv('CONTACT_USERNAME')
 BHARATPE_TOKEN = os.getenv('BHARATPE_TOKEN')
+WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL')  # optional — shown on /start; falls back to text-only if not set
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = MongoClient(MONGO_URI)
@@ -46,13 +47,30 @@ def show_plans(chat_id, ch_id):
         return
     markup = InlineKeyboardMarkup()
     for p_time, p_price in ch_data['plans'].items():
-        label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
+        if str(p_time).strip().lower() == "lifetime":
+            label = "Lifetime"
+        else:
+            label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
         markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
 
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
     bot.send_message(chat_id,
         f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:",
         reply_markup=markup, parse_mode="Markdown")
+
+def show_channel_list(chat_id):
+    markup = InlineKeyboardMarkup()
+    cursor = channels_col.find({})
+    count = 0
+    for ch in cursor:
+        markup.add(InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"viewch_{ch['channel_id']}"))
+        count += 1
+    markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
+
+    if count == 0:
+        bot.send_message(chat_id, "No channels are available for subscription right now. Please check back later.")
+    else:
+        bot.send_message(chat_id, "📢 *SELECT A CHANNEL*\n\nChoose one of our premium channels from below to view plans and pricing:", reply_markup=markup, parse_mode="Markdown")
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
@@ -72,17 +90,20 @@ def start_handler(message):
         bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/admin - Open Admin Panel\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
     else:
         markup = InlineKeyboardMarkup()
-        cursor = channels_col.find({})
-        count = 0
-        for ch in cursor:
-            markup.add(InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"viewch_{ch['channel_id']}"))
-            count += 1
-        markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-
-        if count == 0:
-            bot.send_message(message.chat.id, "Welcome! No channels are available for subscription right now. Please check back later.")
+        markup.add(InlineKeyboardButton("💎 BUY MEMBERSHIP", callback_data="buy_membership"))
+        caption = (f"👋 Welcome, {message.from_user.first_name}!\n\n"
+                   f"I am your Premium Subscription Bot. 🤖\n"
+                   f"I can help you get instant access to our exclusive premium channels.\n\n"
+                   f"👇 Click on Buy Membership button below to browse our premium channel plans!")
+        if WELCOME_IMAGE_URL:
+            bot.send_photo(message.chat.id, WELCOME_IMAGE_URL, caption=caption, reply_markup=markup)
         else:
-            bot.send_message(message.chat.id, "Welcome! 👋\n\nHere are the channels available for subscription:", reply_markup=markup)
+            bot.send_message(message.chat.id, caption, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "buy_membership")
+def buy_membership(call):
+    bot.answer_callback_query(call.id)
+    show_channel_list(call.message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('viewch_'))
 def view_channel(call):
@@ -159,7 +180,7 @@ def admin_panel(message):
 def adm_stats(call):
     bot.answer_callback_query(call.id)
     total_channels = channels_col.count_documents({"admin_id": ADMIN_ID})
-    active_subs = users_col.count_documents({"expiry": {"$gt": datetime.now().timestamp()}})
+    active_subs = users_col.count_documents({"$or": [{"expiry": {"$gt": datetime.now().timestamp()}}, {"lifetime": True}]})
     total_approvals = used_utrs_col.count_documents({})
     total_revenue = sum(a.get("amount", 0) for a in used_utrs_col.find({}))
 
@@ -179,7 +200,7 @@ def adm_stats(call):
 def adm_active(call):
     bot.answer_callback_query(call.id)
     now = datetime.now().timestamp()
-    active = list(users_col.find({"expiry": {"$gt": now}}).sort("expiry", 1))
+    active = list(users_col.find({"$or": [{"expiry": {"$gt": now}}, {"lifetime": True}]}).sort("expiry", 1))
 
     if not active:
         bot.send_message(call.message.chat.id, "No active subscribers right now.")
@@ -189,8 +210,11 @@ def adm_active(call):
     for u in active[:25]:
         ch_data = channels_col.find_one({"channel_id": u['channel_id']})
         ch_name = ch_data['name'] if ch_data else str(u['channel_id'])
-        remaining_min = int((u['expiry'] - now) / 60)
-        lines.append(f"• User {u['user_id']} — {ch_name} — expires in {remaining_min} min")
+        if u.get("lifetime"):
+            lines.append(f"• User {u['user_id']} — {ch_name} — Lifetime ♾️")
+        else:
+            remaining_min = int((u['expiry'] - now) / 60)
+            lines.append(f"• User {u['user_id']} — {ch_name} — expires in {remaining_min} min")
     if len(active) > 25:
         lines.append(f"... and {len(active) - 25} more")
 
@@ -241,33 +265,31 @@ def grantch(call):
     bot.answer_callback_query(call.id)
     ch_id = int(call.data.split('_')[1])
     msg = bot.send_message(call.message.chat.id,
-        "Send the user's Telegram ID and duration in minutes, separated by a space.\n\nExample: `123456789 1440` (grants that user 1440 minutes / 1 day)",
+        "Send the user's Telegram ID and duration in minutes, separated by a space.\n\nExample: `123456789 1440` (grants 1440 minutes / 1 day)\nOr for lifetime: `123456789 lifetime`",
         parse_mode="Markdown")
     bot.register_next_step_handler(msg, process_grant, ch_id)
 
 def process_grant(message, ch_id):
     try:
         parts = message.text.strip().split()
-        target_id, mins = int(parts[0]), int(parts[1])
+        target_id = int(parts[0])
+        mins = parts[1]  # keep as string — may be "lifetime" or a number
+        if mins.lower() != "lifetime":
+            int(mins)  # validate it's numeric if not lifetime
     except Exception:
-        bot.send_message(ADMIN_ID, "❌ Invalid format. Use: `user_id minutes` — e.g. `123456789 1440`. Try /admin again to retry.", parse_mode="Markdown")
+        bot.send_message(ADMIN_ID, "❌ Invalid format. Use: `user_id minutes` or `user_id lifetime`. Try /admin again to retry.", parse_mode="Markdown")
         return
 
     try:
-        expiry_datetime = datetime.now() + timedelta(minutes=mins)
-        expiry_ts = int(expiry_datetime.timestamp())
-        link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
+        link, is_lifetime = create_access(target_id, ch_id, mins)
 
-        users_col.update_one(
-            {"user_id": target_id, "channel_id": ch_id},
-            {"$set": {"expiry": expiry_datetime.timestamp()}},
-            upsert=True
-        )
+        if is_lifetime:
+            msg_text = f"🎁 <b>Access Granted by Admin!</b>\n\nSubscription: Lifetime Membership ♾️\n\nJoin Link: {link.invite_link}\n\n✅ This is a lifetime membership — no expiry!"
+        else:
+            msg_text = f"🎁 <b>Access Granted by Admin!</b>\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes."
 
-        bot.send_message(target_id,
-            f"🎁 <b>Access Granted by Admin!</b>\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes.",
-            parse_mode="HTML")
-        bot.send_message(ADMIN_ID, f"✅ Granted user {target_id} {mins} mins access manually.")
+        bot.send_message(target_id, msg_text, parse_mode="HTML")
+        bot.send_message(ADMIN_ID, f"✅ Granted user {target_id} {'Lifetime' if is_lifetime else mins + ' mins'} access manually.")
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Error granting access: {e}")
 
@@ -309,6 +331,28 @@ def process_remove(message, ch_id):
         bot.send_message(ADMIN_ID, f"❌ Error removing member: {e}\n\n(Note removed from database anyway if they were tracked.)")
         users_col.delete_one({"user_id": target_id, "channel_id": ch_id})
 
+def create_access(user_id, ch_id, mins):
+    """Creates the invite link and updates the user's record. mins may be the string 'lifetime' or a number-as-string. Returns (invite_link_obj, is_lifetime)."""
+    is_lifetime = str(mins).strip().lower() == "lifetime"
+    if is_lifetime:
+        link = bot.create_chat_invite_link(ch_id, member_limit=1)
+        users_col.update_one(
+            {"user_id": user_id, "channel_id": ch_id},
+            {"$set": {"lifetime": True}, "$unset": {"expiry": ""}},
+            upsert=True
+        )
+    else:
+        mins_int = int(mins)
+        expiry_datetime = datetime.now() + timedelta(minutes=mins_int)
+        expiry_ts = int(expiry_datetime.timestamp())
+        link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
+        users_col.update_one(
+            {"user_id": user_id, "channel_id": ch_id},
+            {"$set": {"expiry": expiry_datetime.timestamp()}, "$unset": {"lifetime": ""}},
+            upsert=True
+        )
+    return link, is_lifetime
+
 # --- USER: PAYMENT FLOW ---
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('select_'))
@@ -318,13 +362,14 @@ def user_pays(call):
     price = ch_data['plans'][mins]
     
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={price}%26cu=INR"
-    
+    plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
+
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
     
     bot.send_photo(call.message.chat.id, qr_url, 
-                   caption=f"Plan: {mins} Minutes\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.", 
+                   caption=f"Plan: {plan_label}\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.", 
                    reply_markup=markup, parse_mode="Markdown")
 
     pending_payments[call.from_user.id] = {"ch_id": int(ch_id), "mins": mins, "price": int(price)}
@@ -371,24 +416,18 @@ def verify_utr(msg):
         bot.send_message(ADMIN_ID, f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{plan['price']}, utr {utr}")
         return
 
-    ch_id, mins = plan["ch_id"], int(plan["mins"])
+    ch_id, mins = plan["ch_id"], plan["mins"]
     try:
-        expiry_datetime = datetime.now() + timedelta(minutes=mins)
-        expiry_ts = int(expiry_datetime.timestamp())
-
-        link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
-
-        users_col.update_one(
-            {"user_id": user_id, "channel_id": ch_id},
-            {"$set": {"expiry": expiry_datetime.timestamp()}},
-            upsert=True
-        )
+        link, is_lifetime = create_access(user_id, ch_id, mins)
         used_utrs_col.insert_one({"utr": utr, "user_id": user_id, "ch_id": ch_id, "amount": paid_amount, "used_at": datetime.now()})
 
-        bot.send_message(user_id,
-                          f"🎉 <b>Payment Verified!</b>\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes.",
-                          parse_mode="HTML")
-        bot.send_message(ADMIN_ID, f"✅ Auto-approved user {user_id} for {mins} mins via UTR {utr} (₹{paid_amount}).")
+        if is_lifetime:
+            msg_text = f"🎉 <b>Payment Verified!</b>\n\nSubscription: Lifetime Membership ♾️\n\nJoin Link: {link.invite_link}\n\n✅ This is a lifetime membership — no expiry!"
+        else:
+            msg_text = f"🎉 <b>Payment Verified!</b>\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes."
+
+        bot.send_message(user_id, msg_text, parse_mode="HTML")
+        bot.send_message(ADMIN_ID, f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UTR {utr} (₹{paid_amount}).")
         del pending_payments[user_id]
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Error during auto-approval: {e}")
