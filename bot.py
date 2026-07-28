@@ -35,6 +35,7 @@ db = client['sub_management']
 channels_col = db['channels']
 users_col = db['users']
 used_utrs_col = db['used_utrs']  # permanent record of spent UTRs, never touched by kick_expired_users
+settings_col = db['settings']  # small key/value store for things like the welcome image
 
 # In-memory tracker: user_id -> {"ch_id":.., "mins":.., "price":..}
 pending_payments = {}
@@ -72,6 +73,14 @@ def show_channel_list(chat_id):
     else:
         bot.send_message(chat_id, "📢 *SELECT A CHANNEL*\n\nChoose one of our premium channels from below to view plans and pricing:", reply_markup=markup, parse_mode="Markdown")
 
+def get_welcome_image():
+    """Returns a Telegram file_id or URL to use for the /start image, or None if none is set.
+    A photo set via the admin panel (stored as a file_id) takes priority over WELCOME_IMAGE_URL."""
+    setting = settings_col.find_one({"key": "welcome_image"})
+    if setting and setting.get("value"):
+        return setting["value"]
+    return WELCOME_IMAGE_URL
+
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
@@ -95,8 +104,9 @@ def start_handler(message):
                    f"I am your Premium Subscription Bot. 🤖\n"
                    f"I can help you get instant access to our exclusive premium channels.\n\n"
                    f"👇 Click on Buy Membership button below to browse our premium channel plans!")
-        if WELCOME_IMAGE_URL:
-            bot.send_photo(message.chat.id, WELCOME_IMAGE_URL, caption=caption, reply_markup=markup)
+        welcome_image = get_welcome_image()
+        if welcome_image:
+            bot.send_photo(message.chat.id, welcome_image, caption=caption, reply_markup=markup)
         else:
             bot.send_message(message.chat.id, caption, reply_markup=markup)
 
@@ -174,6 +184,7 @@ def admin_panel(message):
     markup.add(InlineKeyboardButton("🚫 Remove Membership", callback_data="adm_remove"))
     markup.add(InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast"))
     markup.add(InlineKeyboardButton("📋 Manage Channels", callback_data="adm_channels"))
+    markup.add(InlineKeyboardButton("🖼 Set Welcome Image", callback_data="adm_setimg"))
     bot.send_message(message.chat.id, "🛠 *Admin Panel*\n\nChoose an option:", reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_stats")
@@ -330,6 +341,29 @@ def process_remove(message, ch_id):
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Error removing member: {e}\n\n(Note removed from database anyway if they were tracked.)")
         users_col.delete_one({"user_id": target_id, "channel_id": ch_id})
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_setimg")
+def adm_setimg(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id,
+        "🖼 Send the photo you want to use as the /start welcome image.\n\nSend /cancel to abort, or /remove to go back to no image.")
+    bot.register_next_step_handler(msg, process_setimg)
+
+def process_setimg(message):
+    if message.text and message.text.strip() == "/cancel":
+        bot.send_message(ADMIN_ID, "Cancelled — welcome image unchanged.")
+        return
+    if message.text and message.text.strip() == "/remove":
+        settings_col.delete_one({"key": "welcome_image"})
+        bot.send_message(ADMIN_ID, "🗑 Welcome image removed. /start will now show text only (unless WELCOME_IMAGE_URL is set).")
+        return
+    if not message.photo:
+        bot.send_message(ADMIN_ID, "❌ That wasn't a photo. Try /admin → 🖼 Set Welcome Image again, or send /cancel.")
+        return
+
+    file_id = message.photo[-1].file_id
+    settings_col.update_one({"key": "welcome_image"}, {"$set": {"value": file_id}}, upsert=True)
+    bot.send_message(ADMIN_ID, "✅ Welcome image updated! It'll show the next time anyone taps /start.")
 
 def create_access(user_id, ch_id, mins):
     """Creates the invite link and updates the user's record. mins may be the string 'lifetime' or a number-as-string. Returns (invite_link_obj, is_lifetime)."""
