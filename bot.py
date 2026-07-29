@@ -79,8 +79,6 @@ def show_plans(chat_id, ch_id):
             label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
         markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
 
-    markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-
     if ch_data.get('description'):
         caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
                    f"<blockquote>{esc(ch_data['description'])}</blockquote>\n\n"
