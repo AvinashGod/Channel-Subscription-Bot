@@ -62,6 +62,11 @@ def send_page(chat_id, text, photo=None, reply_markup=None, parse_mode=None):
 
 # --- ADMIN LOGIC ---
 
+import html as _html
+
+def esc(s):
+    return _html.escape(str(s))
+
 def show_plans(chat_id, ch_id):
     ch_data = channels_col.find_one({"channel_id": ch_id})
     if not ch_data:
@@ -75,8 +80,15 @@ def show_plans(chat_id, ch_id):
         markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
 
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-    caption = f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:"
-    send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="Markdown")
+
+    if ch_data.get('description'):
+        caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
+                   f"<blockquote>{esc(ch_data['description'])}</blockquote>\n\n"
+                   f"Please select a subscription plan below:")
+    else:
+        caption = f"Welcome!\n\nYou are joining: <b>{esc(ch_data['name'])}</b>.\n\nPlease select a subscription plan below:"
+
+    send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="HTML")
 
 def show_channel_list(chat_id):
     markup = InlineKeyboardMarkup()
@@ -516,12 +528,36 @@ def manage_ch(call):
     link = f"https://t.me/{bot_username}?start={ch_id}"
 
     markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📝 Set Channel Details", callback_data=f"setdesc_{ch_id}"))
     markup.add(InlineKeyboardButton("🖼 Set Channel Image", callback_data=f"setchimg_{ch_id}"))
     markup.add(InlineKeyboardButton("🗑 Delete Channel", callback_data=f"delch_{ch_id}"))
 
     bot.edit_message_text(f"Settings for: *{ch_data['name']}*\n\nYour Link: `{link}`\n\nTo edit prices, use /add and forward a message from this channel again.", 
                           call.message.chat.id, call.message.message_id, parse_mode="Markdown",
                           reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('setdesc_'))
+def setdesc(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    msg = bot.send_message(call.message.chat.id,
+        "📝 Send the channel details text you want shown to users (features, what's included, etc.) before they pick a plan.\n\nSend /cancel to abort, or /remove to clear it.")
+    bot.register_next_step_handler(msg, process_setdesc, ch_id)
+
+def process_setdesc(message, ch_id):
+    if message.text and message.text.strip() == "/cancel":
+        bot.send_message(ADMIN_ID, "Cancelled — channel details unchanged.")
+        return
+    if message.text and message.text.strip() == "/remove":
+        channels_col.update_one({"channel_id": ch_id}, {"$unset": {"description": ""}})
+        bot.send_message(ADMIN_ID, "🗑 Channel details removed.")
+        return
+    if not message.text:
+        bot.send_message(ADMIN_ID, "❌ That wasn't text. Try again via /channels, or send /cancel.")
+        return
+
+    channels_col.update_one({"channel_id": ch_id}, {"$set": {"description": message.text}})
+    bot.send_message(ADMIN_ID, "✅ Channel details updated! It'll show the next time someone views this channel's plans.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('setchimg_'))
 def setchimg(call):
