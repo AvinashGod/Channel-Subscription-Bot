@@ -114,7 +114,6 @@ def get_welcome_image():
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
-    user_id = message.from_user.id
     text = message.text.split()
 
     if len(text) > 1:
@@ -126,17 +125,14 @@ def start_handler(message):
                 return
         except: pass
 
-    if user_id == ADMIN_ID:
-        bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/admin - Open Admin Panel\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
-    else:
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("💎 BUY MEMBERSHIP", callback_data="buy_membership"))
-        caption = (f"👋 Welcome, {message.from_user.first_name}!\n\n"
-                   f"I am your Premium Subscription Bot. 🤖\n"
-                   f"I can help you get instant access to our exclusive premium channels.\n\n"
-                   f"👇 Click on Buy Membership button below to browse our premium channel plans!")
-        welcome_image = get_welcome_image()
-        send_page(message.chat.id, caption, photo=welcome_image, reply_markup=markup)
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💎 BUY MEMBERSHIP", callback_data="buy_membership"))
+    caption = (f"👋 Welcome, {message.from_user.first_name}!\n\n"
+               f"I am your Premium Subscription Bot. 🤖\n"
+               f"I can help you get instant access to our exclusive premium channels.\n\n"
+               f"👇 Click on Buy Membership button below to browse our premium channel plans!")
+    welcome_image = get_welcome_image()
+    send_page(message.chat.id, caption, photo=welcome_image, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == "buy_membership")
 def buy_membership(call):
@@ -181,10 +177,8 @@ def myplan_handler(message):
 def help_handler(message):
     if message.from_user.id == ADMIN_ID:
         text = ("🤖 <b>Admin Commands:</b>\n\n"
-                "/start – Start the bot\n"
-                "/admin – Open Admin Panel\n"
-                "/add – Add/Edit Channel &amp; Prices\n"
-                "/channels – Manage Existing Channels\n"
+                "/start – Start the bot (same view as users)\n"
+                "/admin – Open Admin Panel (add channels, edit prices, stats, grant/remove access, images, and more)\n"
                 "/myplan – Check your plans\n"
                 "/help – Show this help")
     else:
@@ -257,6 +251,7 @@ def finalize_channel(message, ch_id, ch_name):
 @bot.message_handler(commands=['admin'], func=lambda m: m.from_user.id == ADMIN_ID)
 def admin_panel(message):
     markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("➕ Add New Channel", callback_data="add_new"))
     markup.add(InlineKeyboardButton("📊 Stats", callback_data="adm_stats"))
     markup.add(InlineKeyboardButton("👥 Active Subscribers", callback_data="adm_active"))
     markup.add(InlineKeyboardButton("🎁 Manually Grant Access", callback_data="adm_grant"))
@@ -576,13 +571,41 @@ def manage_ch(call):
     link = f"https://t.me/{bot_username}?start={ch_id}"
 
     markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✏️ Edit Plans/Prices", callback_data=f"editplans_{ch_id}"))
     markup.add(InlineKeyboardButton("📝 Set Channel Details", callback_data=f"setdesc_{ch_id}"))
     markup.add(InlineKeyboardButton("🖼 Set Channel Image", callback_data=f"setchimg_{ch_id}"))
     markup.add(InlineKeyboardButton("🗑 Delete Channel", callback_data=f"delch_{ch_id}"))
 
-    bot.edit_message_text(f"Settings for: *{ch_data['name']}*\n\nYour Link: `{link}`\n\nTo edit prices, use /add and forward a message from this channel again.", 
+    bot.edit_message_text(f"Settings for: *{ch_data['name']}*\n\nYour Link: `{link}`",
                           call.message.chat.id, call.message.message_id, parse_mode="Markdown",
                           reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('editplans_'))
+def editplans(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    current = ", ".join(f"{k}:{v}" for k, v in ch_data.get('plans', {}).items())
+    msg = bot.send_message(call.message.chat.id,
+        f"✏️ Current plans for *{ch_data['name']}*:\n`{current}`\n\n"
+        f"Send the new full plan list in format `Min:Price, Min:Price` (use `lifetime` instead of minutes for a lifetime plan). This replaces the plans above entirely.\n\n"
+        f"Example:\n`1440:99, 43200:199, lifetime:499`",
+        parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_editplans, ch_id, ch_data['name'])
+
+def process_editplans(message, ch_id, ch_name):
+    try:
+        raw_plans = message.text.split(',')
+        plans_dict = {}
+        for p in raw_plans:
+            t, pr = p.strip().split(':')
+            t = t.strip()
+            plans_dict[t.lower() if t.lower() == "lifetime" else t] = pr.strip()
+
+        channels_col.update_one({"channel_id": ch_id}, {"$set": {"plans": plans_dict}})
+        bot.send_message(ADMIN_ID, f"✅ Plans updated for *{ch_name}*.", parse_mode="Markdown")
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price, Min:Price`. Try again via /channels.", parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('setdesc_'))
 def setdesc(call):
