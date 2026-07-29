@@ -40,6 +40,26 @@ settings_col = db['settings']  # small key/value store for things like the welco
 # In-memory tracker: user_id -> {"ch_id":.., "mins":.., "price":..}
 pending_payments = {}
 
+# Tracks the last "navigation" message per chat so it can be deleted when a new screen is shown.
+# Payment confirmations, admin notices, and grant/removal messages are sent directly with
+# bot.send_message/send_photo (NOT send_page) so they always persist.
+last_page_msg = {}
+
+def send_page(chat_id, text, photo=None, reply_markup=None, parse_mode=None):
+    old_id = last_page_msg.get(chat_id)
+    if old_id:
+        try:
+            bot.delete_message(chat_id, old_id)
+        except Exception:
+            pass  # already gone / too old to delete — fine, just move on
+
+    if photo:
+        sent = bot.send_photo(chat_id, photo, caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    else:
+        sent = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    last_page_msg[chat_id] = sent.message_id
+    return sent
+
 # --- ADMIN LOGIC ---
 
 def show_plans(chat_id, ch_id):
@@ -55,9 +75,8 @@ def show_plans(chat_id, ch_id):
         markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
 
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-    bot.send_message(chat_id,
-        f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:",
-        reply_markup=markup, parse_mode="Markdown")
+    caption = f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:"
+    send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="Markdown")
 
 def show_channel_list(chat_id):
     markup = InlineKeyboardMarkup()
@@ -69,9 +88,12 @@ def show_channel_list(chat_id):
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
 
     if count == 0:
-        bot.send_message(chat_id, "No channels are available for subscription right now. Please check back later.")
+        send_page(chat_id, "No channels are available for subscription right now. Please check back later.")
     else:
-        bot.send_message(chat_id, "📢 *SELECT A CHANNEL*\n\nChoose one of our premium channels from below to view plans and pricing:", reply_markup=markup, parse_mode="Markdown")
+        list_image_setting = settings_col.find_one({"key": "channel_list_image"})
+        list_image = list_image_setting["value"] if list_image_setting and list_image_setting.get("value") else None
+        send_page(chat_id, "📢 *SELECT A CHANNEL*\n\nChoose one of our premium channels from below to view plans and pricing:",
+                   photo=list_image, reply_markup=markup, parse_mode="Markdown")
 
 def get_welcome_image():
     """Returns a Telegram file_id or URL to use for the /start image, or None if none is set.
@@ -105,10 +127,7 @@ def start_handler(message):
                    f"I can help you get instant access to our exclusive premium channels.\n\n"
                    f"👇 Click on Buy Membership button below to browse our premium channel plans!")
         welcome_image = get_welcome_image()
-        if welcome_image:
-            bot.send_photo(message.chat.id, welcome_image, caption=caption, reply_markup=markup)
-        else:
-            bot.send_message(message.chat.id, caption, reply_markup=markup)
+        send_page(message.chat.id, caption, photo=welcome_image, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == "buy_membership")
 def buy_membership(call):
@@ -185,6 +204,7 @@ def admin_panel(message):
     markup.add(InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast"))
     markup.add(InlineKeyboardButton("📋 Manage Channels", callback_data="adm_channels"))
     markup.add(InlineKeyboardButton("🖼 Set Welcome Image", callback_data="adm_setimg"))
+    markup.add(InlineKeyboardButton("🖼 Set Channel List Image", callback_data="adm_setlistimg"))
     bot.send_message(message.chat.id, "🛠 *Admin Panel*\n\nChoose an option:", reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_stats")
@@ -365,6 +385,29 @@ def process_setimg(message):
     settings_col.update_one({"key": "welcome_image"}, {"$set": {"value": file_id}}, upsert=True)
     bot.send_message(ADMIN_ID, "✅ Welcome image updated! It'll show the next time anyone taps /start.")
 
+@bot.callback_query_handler(func=lambda call: call.data == "adm_setlistimg")
+def adm_setlistimg(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id,
+        "🖼 Send the photo you want to show on the 'Select a Channel' screen.\n\nSend /cancel to abort, or /remove to clear it.")
+    bot.register_next_step_handler(msg, process_setlistimg)
+
+def process_setlistimg(message):
+    if message.text and message.text.strip() == "/cancel":
+        bot.send_message(ADMIN_ID, "Cancelled — channel list image unchanged.")
+        return
+    if message.text and message.text.strip() == "/remove":
+        settings_col.delete_one({"key": "channel_list_image"})
+        bot.send_message(ADMIN_ID, "🗑 Channel list image removed.")
+        return
+    if not message.photo:
+        bot.send_message(ADMIN_ID, "❌ That wasn't a photo. Try /admin → 🖼 Set Channel List Image again, or send /cancel.")
+        return
+
+    file_id = message.photo[-1].file_id
+    settings_col.update_one({"key": "channel_list_image"}, {"$set": {"value": file_id}}, upsert=True)
+    bot.send_message(ADMIN_ID, "✅ Channel list image updated!")
+
 def create_access(user_id, ch_id, mins):
     """Creates the invite link and updates the user's record. mins may be the string 'lifetime' or a number-as-string. Returns (invite_link_obj, is_lifetime)."""
     is_lifetime = str(mins).strip().lower() == "lifetime"
@@ -402,17 +445,16 @@ def user_pays(call):
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
     
-    bot.send_photo(call.message.chat.id, qr_url, 
-                   caption=f"Plan: {plan_label}\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.", 
-                   reply_markup=markup, parse_mode="Markdown")
+    send_page(call.message.chat.id,
+              f"Plan: {plan_label}\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.",
+              photo=qr_url, reply_markup=markup, parse_mode="Markdown")
 
     pending_payments[call.from_user.id] = {"ch_id": int(ch_id), "mins": mins, "price": int(price)}
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
 def ask_for_utr(call):
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id,
-                      "🧾 Please send your 12-digit UTR / transaction reference number now to verify your payment.")
+    send_page(call.message.chat.id, "🧾 Please send your 12-digit UTR / transaction reference number now to verify your payment.")
 
 # --- BHARATPE UTR AUTO-VERIFICATION ---
 
@@ -474,11 +516,36 @@ def manage_ch(call):
     link = f"https://t.me/{bot_username}?start={ch_id}"
 
     markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🖼 Set Channel Image", callback_data=f"setchimg_{ch_id}"))
     markup.add(InlineKeyboardButton("🗑 Delete Channel", callback_data=f"delch_{ch_id}"))
 
     bot.edit_message_text(f"Settings for: *{ch_data['name']}*\n\nYour Link: `{link}`\n\nTo edit prices, use /add and forward a message from this channel again.", 
                           call.message.chat.id, call.message.message_id, parse_mode="Markdown",
                           reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('setchimg_'))
+def setchimg(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    msg = bot.send_message(call.message.chat.id,
+        "🖼 Send the photo you want to show on this channel's plan screen.\n\nSend /cancel to abort, or /remove to clear it.")
+    bot.register_next_step_handler(msg, process_setchimg, ch_id)
+
+def process_setchimg(message, ch_id):
+    if message.text and message.text.strip() == "/cancel":
+        bot.send_message(ADMIN_ID, "Cancelled — channel image unchanged.")
+        return
+    if message.text and message.text.strip() == "/remove":
+        channels_col.update_one({"channel_id": ch_id}, {"$unset": {"image": ""}})
+        bot.send_message(ADMIN_ID, "🗑 Channel image removed.")
+        return
+    if not message.photo:
+        bot.send_message(ADMIN_ID, "❌ That wasn't a photo. Try again via /channels, or send /cancel.")
+        return
+
+    file_id = message.photo[-1].file_id
+    channels_col.update_one({"channel_id": ch_id}, {"$set": {"image": file_id}})
+    bot.send_message(ADMIN_ID, "✅ Channel image updated! It'll show the next time someone views this channel's plans.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('delch_'))
 def confirm_delete_channel(call):
