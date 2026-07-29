@@ -143,6 +143,57 @@ def buy_membership(call):
     bot.answer_callback_query(call.id)
     show_channel_list(call.message.chat.id)
 
+@bot.message_handler(commands=['myplan'])
+def myplan_handler(message):
+    user_id = message.from_user.id
+    now = datetime.now().timestamp()
+    subs = list(users_col.find({"user_id": user_id}))
+    active_subs = [s for s in subs if s.get("lifetime") or s.get("expiry", 0) > now]
+
+    if not active_subs:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💎 Buy Membership", callback_data="buy_membership"))
+        send_page(message.chat.id, "You have no plan history. Click below button to purchase a plan.", reply_markup=markup)
+        return
+
+    lines = ["📋 <b>Your Active Plans</b>\n"]
+    for s in active_subs:
+        ch_data = channels_col.find_one({"channel_id": s['channel_id']})
+        ch_name = esc(ch_data['name']) if ch_data else str(s['channel_id'])
+        if s.get("lifetime"):
+            lines.append(f"• {ch_name} — Lifetime ♾️")
+        else:
+            remaining_sec = s['expiry'] - now
+            days = int(remaining_sec // 86400)
+            hours = int((remaining_sec % 86400) // 3600)
+            mins = int((remaining_sec % 3600) // 60)
+            if days > 0:
+                remain_str = f"{days}d {hours}h remaining"
+            elif hours > 0:
+                remain_str = f"{hours}h {mins}m remaining"
+            else:
+                remain_str = f"{mins}m remaining"
+            lines.append(f"• {ch_name} — {remain_str}")
+
+    send_page(message.chat.id, "\n".join(lines), parse_mode="HTML")
+
+@bot.message_handler(commands=['help'])
+def help_handler(message):
+    if message.from_user.id == ADMIN_ID:
+        text = ("🤖 <b>Admin Commands:</b>\n\n"
+                "/start – Start the bot\n"
+                "/admin – Open Admin Panel\n"
+                "/add – Add/Edit Channel &amp; Prices\n"
+                "/channels – Manage Existing Channels\n"
+                "/myplan – Check your plans\n"
+                "/help – Show this help")
+    else:
+        text = ("🤖 <b>User Commands:</b>\n\n"
+                "/start – Start the bot\n"
+                "/myplan – Check your plans\n"
+                "/help – Show this help")
+    send_page(message.chat.id, text, parse_mode="HTML")
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('viewch_'))
 def view_channel(call):
     bot.answer_callback_query(call.id)
