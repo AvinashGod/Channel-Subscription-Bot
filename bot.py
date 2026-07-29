@@ -97,7 +97,6 @@ def show_channel_list(chat_id):
     for ch in cursor:
         markup.add(InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"viewch_{ch['channel_id']}"))
         count += 1
-    markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
 
     if count == 0:
         send_page(chat_id, "No channels are available for subscription right now. Please check back later.")
