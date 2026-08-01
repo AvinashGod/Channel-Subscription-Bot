@@ -67,10 +67,31 @@ import html as _html
 def esc(s):
     return _html.escape(str(s))
 
-def show_plans(chat_id, ch_id):
+def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
     ch_data = channels_col.find_one({"channel_id": ch_id})
     if not ch_data:
         return
+
+    if user_id and not skip_active_check:
+        now = datetime.now().timestamp()
+        existing = users_col.find_one({"user_id": user_id, "channel_id": ch_id})
+        if existing and (existing.get("lifetime") or existing.get("expiry", 0) > now):
+            if existing.get("lifetime"):
+                status_line = "Lifetime ♾️ — you already have unlimited access."
+            else:
+                remaining_sec = existing["expiry"] - now
+                days = int(remaining_sec // 86400)
+                hours = int((remaining_sec % 86400) // 3600)
+                status_line = f"{days}d {hours}h remaining"
+
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("✅ Yes, Extend", callback_data=f"extendyes_{ch_id}"))
+            markup.add(InlineKeyboardButton("❌ No", callback_data="extendno"))
+            send_page(chat_id,
+                f"ℹ️ You already have an active plan for <b>{esc(ch_data['name'])}</b>.\n\nStatus: {status_line}\n\nDo you want to buy more time and extend it?",
+                reply_markup=markup, parse_mode="HTML")
+            return
+
     markup = InlineKeyboardMarkup()
     for p_time, p_price in ch_data['plans'].items():
         if str(p_time).strip().lower() == "lifetime":
@@ -87,6 +108,17 @@ def show_plans(chat_id, ch_id):
         caption = f"Welcome!\n\nYou are joining: <b>{esc(ch_data['name'])}</b>.\n\nPlease select a subscription plan below:"
 
     send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('extendyes_'))
+def extendyes(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    show_plans(call.message.chat.id, ch_id, user_id=call.from_user.id, skip_active_check=True)
+
+@bot.callback_query_handler(func=lambda call: call.data == "extendno")
+def extendno(call):
+    bot.answer_callback_query(call.id)
+    show_channel_list(call.message.chat.id)
 
 def show_channel_list(chat_id):
     markup = InlineKeyboardMarkup()
@@ -121,7 +153,7 @@ def start_handler(message):
             ch_id = int(text[1])
             ch_data = channels_col.find_one({"channel_id": ch_id})
             if ch_data:
-                show_plans(message.chat.id, ch_id)
+                show_plans(message.chat.id, ch_id, user_id=message.from_user.id)
                 return
         except: pass
 
@@ -192,7 +224,7 @@ def help_handler(message):
 def view_channel(call):
     bot.answer_callback_query(call.id)
     ch_id = int(call.data.split('_')[1])
-    show_plans(call.message.chat.id, ch_id)
+    show_plans(call.message.chat.id, ch_id, user_id=call.from_user.id)
 
 @bot.message_handler(commands=['channels'], func=lambda m: m.from_user.id == ADMIN_ID)
 def list_channels(message):
@@ -464,8 +496,13 @@ def process_setlistimg(message):
     bot.send_message(ADMIN_ID, "✅ Channel list image updated!")
 
 def create_access(user_id, ch_id, mins):
-    """Creates the invite link and updates the user's record. mins may be the string 'lifetime' or a number-as-string. Returns (invite_link_obj, is_lifetime)."""
+    """Creates the invite link and updates the user's record. mins may be the string 'lifetime' or a number-as-string.
+    If the user already has time remaining on this channel, the new duration is added on top instead of resetting.
+    Returns (invite_link_obj, is_lifetime)."""
     is_lifetime = str(mins).strip().lower() == "lifetime"
+    existing = users_col.find_one({"user_id": user_id, "channel_id": ch_id})
+    now_ts = datetime.now().timestamp()
+
     if is_lifetime:
         link = bot.create_chat_invite_link(ch_id, member_limit=1)
         users_col.update_one(
@@ -473,17 +510,27 @@ def create_access(user_id, ch_id, mins):
             {"$set": {"lifetime": True}, "$unset": {"expiry": ""}},
             upsert=True
         )
-    else:
-        mins_int = int(mins)
-        expiry_datetime = datetime.now() + timedelta(minutes=mins_int)
-        expiry_ts = int(expiry_datetime.timestamp())
-        link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
-        users_col.update_one(
-            {"user_id": user_id, "channel_id": ch_id},
-            {"$set": {"expiry": expiry_datetime.timestamp()}, "$unset": {"lifetime": ""}},
-            upsert=True
-        )
-    return link, is_lifetime
+        return link, True
+
+    if existing and existing.get("lifetime"):
+        # Already a lifetime member — don't downgrade them, just issue a fresh invite link.
+        link = bot.create_chat_invite_link(ch_id, member_limit=1)
+        return link, True
+
+    mins_int = int(mins)
+    base_ts = now_ts
+    if existing and existing.get("expiry", 0) > now_ts:
+        base_ts = existing["expiry"]  # extend from their current remaining time, not from now
+
+    expiry_datetime = datetime.fromtimestamp(base_ts) + timedelta(minutes=mins_int)
+    expiry_ts = int(expiry_datetime.timestamp())
+    link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
+    users_col.update_one(
+        {"user_id": user_id, "channel_id": ch_id},
+        {"$set": {"expiry": expiry_datetime.timestamp()}, "$unset": {"lifetime": ""}},
+        upsert=True
+    )
+    return link, False
 
 # --- USER: PAYMENT FLOW ---
 
