@@ -1,7 +1,7 @@
 import os
 import requests
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -40,16 +40,36 @@ settings_col = db['settings']  # small key/value store for things like the welco
 # In-memory tracker: user_id -> {"ch_id":.., "mins":.., "price":..}
 pending_payments = {}
 
-# Tracks the last "navigation" message per chat so it can be deleted when a new screen is shown.
+# Tracks the last "navigation" message per chat: {"message_id": ..., "has_photo": bool}
+# so a button tap can edit it in place, while a typed command still deletes and sends fresh.
 # Payment confirmations, admin notices, and grant/removal messages are sent directly with
 # bot.send_message/send_photo (NOT send_page) so they always persist.
 last_page_msg = {}
 
-def send_page(chat_id, text, photo=None, reply_markup=None, parse_mode=None):
-    old_id = last_page_msg.get(chat_id)
-    if old_id:
+def send_page(chat_id, text, photo=None, reply_markup=None, parse_mode=None, force_new=False):
+    info = last_page_msg.get(chat_id)
+
+    if not force_new and info:
         try:
-            bot.delete_message(chat_id, old_id)
+            if photo and info.get('has_photo'):
+                # Same type (photo -> photo): edit the image, caption, and buttons in place
+                media = InputMediaPhoto(media=photo, caption=text, parse_mode=parse_mode)
+                bot.edit_message_media(media=media, chat_id=chat_id, message_id=info['message_id'], reply_markup=reply_markup)
+                last_page_msg[chat_id] = {"message_id": info['message_id'], "has_photo": True}
+                return
+            elif not photo and not info.get('has_photo'):
+                # Same type (text -> text): edit the text and buttons in place
+                bot.edit_message_text(text, chat_id=chat_id, message_id=info['message_id'], reply_markup=reply_markup, parse_mode=parse_mode)
+                last_page_msg[chat_id] = {"message_id": info['message_id'], "has_photo": False}
+                return
+            # else: type mismatch (text<->photo) — Telegram can't convert message type via edit,
+            # fall through to delete + send new below
+        except Exception:
+            pass  # edit failed (e.g. "message not modified", too old to edit, etc.) — fall back to delete+resend
+
+    if info:
+        try:
+            bot.delete_message(chat_id, info['message_id'])
         except Exception:
             pass  # already gone / too old to delete — fine, just move on
 
@@ -57,7 +77,7 @@ def send_page(chat_id, text, photo=None, reply_markup=None, parse_mode=None):
         sent = bot.send_photo(chat_id, photo, caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
     else:
         sent = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-    last_page_msg[chat_id] = sent.message_id
+    last_page_msg[chat_id] = {"message_id": sent.message_id, "has_photo": bool(photo)}
     return sent
 
 # --- ADMIN LOGIC ---
@@ -92,7 +112,7 @@ def plan_button_text(p_time, p_val):
         return f"{custom_label} - ₹{price} ({duration_str})"
     return f"💳 {duration_str} - ₹{price}"
 
-def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
+def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=False):
     ch_data = channels_col.find_one({"channel_id": ch_id})
     if not ch_data:
         return
@@ -114,7 +134,7 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
             markup.add(InlineKeyboardButton("❌ No", callback_data="extendno"))
             send_page(chat_id,
                 f"ℹ️ You already have an active plan for <b>{esc(disp_name(ch_data))}</b>.\n\nStatus: {status_line}\n\nDo you want to buy more time and extend it?",
-                reply_markup=markup, parse_mode="HTML")
+                reply_markup=markup, parse_mode="HTML", force_new=force_new)
             return
 
     markup = InlineKeyboardMarkup()
@@ -128,7 +148,7 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
     else:
         caption = f"Welcome!\n\nYou are joining: <b>{esc(disp_name(ch_data))}</b>.\n\nPlease select a subscription plan below:"
 
-    send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="HTML")
+    send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="HTML", force_new=force_new)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('extendyes_'))
 def extendyes(call):
@@ -174,7 +194,7 @@ def start_handler(message):
             ch_id = int(text[1])
             ch_data = channels_col.find_one({"channel_id": ch_id})
             if ch_data:
-                show_plans(message.chat.id, ch_id, user_id=message.from_user.id)
+                show_plans(message.chat.id, ch_id, user_id=message.from_user.id, force_new=True)
                 return
         except: pass
 
@@ -185,7 +205,7 @@ def start_handler(message):
                f"I can help you get instant access to our exclusive premium channels.\n\n"
                f"👇 Click on Buy Membership button below to browse our premium channel plans!")
     welcome_image = get_welcome_image()
-    send_page(message.chat.id, caption, photo=welcome_image, reply_markup=markup)
+    send_page(message.chat.id, caption, photo=welcome_image, reply_markup=markup, force_new=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "buy_membership")
 def buy_membership(call):
@@ -202,7 +222,7 @@ def myplan_handler(message):
     if not active_subs:
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("💎 Buy Membership", callback_data="buy_membership"))
-        send_page(message.chat.id, "You have no plan history. Click below button to purchase a plan.", reply_markup=markup)
+        send_page(message.chat.id, "You have no plan history. Click below button to purchase a plan.", reply_markup=markup, force_new=True)
         return
 
     lines = ["📋 <b>Your Active Plans</b>\n"]
@@ -224,7 +244,7 @@ def myplan_handler(message):
                 remain_str = f"{mins}m remaining"
             lines.append(f"• {ch_name} — {remain_str}")
 
-    send_page(message.chat.id, "\n".join(lines), parse_mode="HTML")
+    send_page(message.chat.id, "\n".join(lines), parse_mode="HTML", force_new=True)
 
 @bot.message_handler(commands=['help'])
 def help_handler(message):
@@ -239,7 +259,7 @@ def help_handler(message):
                 "/start – Start the bot\n"
                 "/myplan – Check your plans\n"
                 "/help – Show this help")
-    send_page(message.chat.id, text, parse_mode="HTML")
+    send_page(message.chat.id, text, parse_mode="HTML", force_new=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('viewch_'))
 def view_channel(call):
