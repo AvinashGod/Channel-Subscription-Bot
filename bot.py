@@ -129,7 +129,7 @@ def show_channel_list(chat_id):
     cursor = channels_col.find({})
     count = 0
     for ch in cursor:
-        markup.add(InlineKeyboardButton(f"📢 {disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
+        markup.add(InlineKeyboardButton(f"{disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
         count += 1
 
     if count == 0:
