@@ -71,6 +71,27 @@ def disp_name(ch_data):
     """Returns the admin-set display name if one is configured, otherwise the real Telegram channel title."""
     return ch_data.get('display_name') or ch_data['name']
 
+def plan_info(p_val):
+    """A plan value can be a plain price string (legacy / no custom label) or a dict {'price':..,'label':..}.
+    Returns (price, label_or_None) either way."""
+    if isinstance(p_val, dict):
+        return p_val.get('price'), p_val.get('label')
+    return p_val, None
+
+def plan_button_text(p_time, p_val):
+    price, custom_label = plan_info(p_val)
+    if str(p_time).strip().lower() == "lifetime":
+        duration_str = "Lifetime"
+    elif int(p_time) < 60:
+        duration_str = f"{p_time} Min"
+    else:
+        days = int(p_time) // 1440
+        duration_str = f"{days} Day" if days == 1 else f"{days} Days"
+
+    if custom_label:
+        return f"{custom_label} - ₹{price} ({duration_str})"
+    return f"💳 {duration_str} - ₹{price}"
+
 def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
     ch_data = channels_col.find_one({"channel_id": ch_id})
     if not ch_data:
@@ -97,12 +118,8 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
             return
 
     markup = InlineKeyboardMarkup()
-    for p_time, p_price in ch_data['plans'].items():
-        if str(p_time).strip().lower() == "lifetime":
-            label = "Lifetime"
-        else:
-            label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
-        markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
+    for p_time, p_val in ch_data['plans'].items():
+        markup.add(InlineKeyboardButton(plan_button_text(p_time, p_val), callback_data=f"select_{ch_id}_{p_time}"))
 
     if ch_data.get('description'):
         caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
@@ -129,7 +146,7 @@ def show_channel_list(chat_id):
     cursor = channels_col.find({})
     count = 0
     for ch in cursor:
-        markup.add(InlineKeyboardButton(f"{disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
+        markup.add(InlineKeyboardButton(f"📢 {disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
         count += 1
 
     if count == 0:
@@ -262,8 +279,9 @@ def get_plans(message):
         ch_id = message.forward_from_chat.id
         ch_name = message.forward_from_chat.title
         msg = bot.send_message(ADMIN_ID, 
-            f"Channel Detected: *{ch_name}*\n\nEnter plans in format (Minutes:Price):\n`Min:Price, Min:Price` \n\n"
-            "Example:\n`1440:99, 43200:199` (1 Day and 30 Days)", parse_mode="Markdown")
+            f"Channel Detected: *{ch_name}*\n\nEnter plans in format:\n`Min:Price` or `Min:Price:Label`\n\n"
+            "Separate multiple plans with commas. Use `lifetime` instead of minutes for a lifetime plan. A custom label is optional — leave it out to use the default \"X Days - ₹Y\" style.\n\n"
+            "Example:\n`1440:39, 10080:69:🥈 Silver Plan, lifetime:199:🥇 Gold Plan`", parse_mode="Markdown")
         bot.register_next_step_handler(msg, finalize_channel, ch_id, ch_name)
     else:
         bot.send_message(ADMIN_ID, "❌ Error: Message was not forwarded. Use /add to try again.")
@@ -273,14 +291,18 @@ def finalize_channel(message, ch_id, ch_name):
         raw_plans = message.text.split(',')
         plans_dict = {}
         for p in raw_plans:
-            t, pr = p.strip().split(':')
-            plans_dict[t] = pr
-        
+            parts = p.strip().split(':', 2)
+            t = parts[0].strip()
+            t = t.lower() if t.lower() == "lifetime" else t
+            pr = parts[1].strip()
+            label = parts[2].strip() if len(parts) == 3 else None
+            plans_dict[t] = {"price": pr, "label": label} if label else pr
+
         channels_col.update_one({"channel_id": ch_id}, {"$set": {"name": ch_name, "plans": plans_dict, "admin_id": ADMIN_ID}}, upsert=True)
         bot_username = bot.get_me().username
         bot.send_message(ADMIN_ID, f"✅ Setup Successful!\n\nInvite Link for users:\n`https://t.me/{bot_username}?start={ch_id}`", parse_mode="Markdown")
     except:
-        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price, Min:Price`. Use /add to retry.")
+        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price` or `Min:Price:Label`. Use /add to retry.")
 
 # --- ADMIN PANEL ---
 
@@ -542,10 +564,13 @@ def create_access(user_id, ch_id, mins):
 def user_pays(call):
     _, ch_id, mins = call.data.split('_')
     ch_data = channels_col.find_one({"channel_id": int(ch_id)})
-    price = ch_data['plans'][mins]
-    
+    price, custom_label = plan_info(ch_data['plans'][mins])
+
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={price}%26cu=INR"
-    plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
+    if custom_label:
+        plan_label = custom_label
+    else:
+        plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
 
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}"))
@@ -661,11 +686,15 @@ def editplans(call):
     bot.answer_callback_query(call.id)
     ch_id = int(call.data.split('_')[1])
     ch_data = channels_col.find_one({"channel_id": ch_id})
-    current = ", ".join(f"{k}:{v}" for k, v in ch_data.get('plans', {}).items())
+    current_parts = []
+    for k, v in ch_data.get('plans', {}).items():
+        price, label = plan_info(v)
+        current_parts.append(f"{k}:{price}:{label}" if label else f"{k}:{price}")
+    current = ", ".join(current_parts)
     msg = bot.send_message(call.message.chat.id,
         f"✏️ Current plans for *{ch_data['name']}*:\n`{current}`\n\n"
-        f"Send the new full plan list in format `Min:Price, Min:Price` (use `lifetime` instead of minutes for a lifetime plan). This replaces the plans above entirely.\n\n"
-        f"Example:\n`1440:99, 43200:199, lifetime:499`",
+        f"Send the new full plan list in format `Min:Price` or `Min:Price:Label` (use `lifetime` instead of minutes for a lifetime plan). This replaces the plans above entirely. A custom label is optional.\n\n"
+        f"Example:\n`1440:39, 10080:69:🥈 Silver Plan, lifetime:199:🥇 Gold Plan`",
         parse_mode="Markdown")
     bot.register_next_step_handler(msg, process_editplans, ch_id, ch_data['name'])
 
@@ -674,14 +703,17 @@ def process_editplans(message, ch_id, ch_name):
         raw_plans = message.text.split(',')
         plans_dict = {}
         for p in raw_plans:
-            t, pr = p.strip().split(':')
-            t = t.strip()
-            plans_dict[t.lower() if t.lower() == "lifetime" else t] = pr.strip()
+            parts = p.strip().split(':', 2)
+            t = parts[0].strip()
+            t = t.lower() if t.lower() == "lifetime" else t
+            pr = parts[1].strip()
+            label = parts[2].strip() if len(parts) == 3 else None
+            plans_dict[t] = {"price": pr, "label": label} if label else pr
 
         channels_col.update_one({"channel_id": ch_id}, {"$set": {"plans": plans_dict}})
         bot.send_message(ADMIN_ID, f"✅ Plans updated for *{ch_name}*.", parse_mode="Markdown")
     except Exception:
-        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price, Min:Price`. Try again via /channels.", parse_mode="Markdown")
+        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price` or `Min:Price:Label`. Try again via /channels.", parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('setdesc_'))
 def setdesc(call):
