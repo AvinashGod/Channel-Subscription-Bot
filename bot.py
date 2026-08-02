@@ -67,6 +67,10 @@ import html as _html
 def esc(s):
     return _html.escape(str(s))
 
+def disp_name(ch_data):
+    """Returns the admin-set display name if one is configured, otherwise the real Telegram channel title."""
+    return ch_data.get('display_name') or ch_data['name']
+
 def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
     ch_data = channels_col.find_one({"channel_id": ch_id})
     if not ch_data:
@@ -88,7 +92,7 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
             markup.add(InlineKeyboardButton("✅ Yes, Extend", callback_data=f"extendyes_{ch_id}"))
             markup.add(InlineKeyboardButton("❌ No", callback_data="extendno"))
             send_page(chat_id,
-                f"ℹ️ You already have an active plan for <b>{esc(ch_data['name'])}</b>.\n\nStatus: {status_line}\n\nDo you want to buy more time and extend it?",
+                f"ℹ️ You already have an active plan for <b>{esc(disp_name(ch_data))}</b>.\n\nStatus: {status_line}\n\nDo you want to buy more time and extend it?",
                 reply_markup=markup, parse_mode="HTML")
             return
 
@@ -105,7 +109,7 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False):
                    f"<blockquote>{esc(ch_data['description'])}</blockquote>\n\n"
                    f"Please select a subscription plan below:")
     else:
-        caption = f"Welcome!\n\nYou are joining: <b>{esc(ch_data['name'])}</b>.\n\nPlease select a subscription plan below:"
+        caption = f"Welcome!\n\nYou are joining: <b>{esc(disp_name(ch_data))}</b>.\n\nPlease select a subscription plan below:"
 
     send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="HTML")
 
@@ -125,7 +129,7 @@ def show_channel_list(chat_id):
     cursor = channels_col.find({})
     count = 0
     for ch in cursor:
-        markup.add(InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"viewch_{ch['channel_id']}"))
+        markup.add(InlineKeyboardButton(f"📢 {disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
         count += 1
 
     if count == 0:
@@ -187,7 +191,7 @@ def myplan_handler(message):
     lines = ["📋 <b>Your Active Plans</b>\n"]
     for s in active_subs:
         ch_data = channels_col.find_one({"channel_id": s['channel_id']})
-        ch_name = esc(ch_data['name']) if ch_data else str(s['channel_id'])
+        ch_name = esc(disp_name(ch_data)) if ch_data else str(s['channel_id'])
         if s.get("lifetime"):
             lines.append(f"• {ch_name} — Lifetime ♾️")
         else:
@@ -618,14 +622,39 @@ def manage_ch(call):
     link = f"https://t.me/{bot_username}?start={ch_id}"
 
     markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🏷 Set Display Name", callback_data=f"setname_{ch_id}"))
     markup.add(InlineKeyboardButton("✏️ Edit Plans/Prices", callback_data=f"editplans_{ch_id}"))
     markup.add(InlineKeyboardButton("📝 Set Channel Details", callback_data=f"setdesc_{ch_id}"))
     markup.add(InlineKeyboardButton("🖼 Set Channel Image", callback_data=f"setchimg_{ch_id}"))
     markup.add(InlineKeyboardButton("🗑 Delete Channel", callback_data=f"delch_{ch_id}"))
 
-    bot.edit_message_text(f"Settings for: *{ch_data['name']}*\n\nYour Link: `{link}`",
+    display_line = f"\nShown to users as: *{ch_data['display_name']}*" if ch_data.get('display_name') else "\nShown to users as: (real channel name — no custom display name set)"
+    bot.edit_message_text(f"Settings for: *{ch_data['name']}*{display_line}\n\nYour Link: `{link}`",
                           call.message.chat.id, call.message.message_id, parse_mode="Markdown",
                           reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('setname_'))
+def setname(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    msg = bot.send_message(call.message.chat.id,
+        "🏷 Send the name you want shown to users instead of the real channel title.\n\nSend /cancel to abort, or /remove to go back to showing the real channel name.")
+    bot.register_next_step_handler(msg, process_setname, ch_id)
+
+def process_setname(message, ch_id):
+    if message.text and message.text.strip() == "/cancel":
+        bot.send_message(ADMIN_ID, "Cancelled — display name unchanged.")
+        return
+    if message.text and message.text.strip() == "/remove":
+        channels_col.update_one({"channel_id": ch_id}, {"$unset": {"display_name": ""}})
+        bot.send_message(ADMIN_ID, "🗑 Display name removed. Users will now see the real channel name.")
+        return
+    if not message.text:
+        bot.send_message(ADMIN_ID, "❌ That wasn't text. Try again via /channels, or send /cancel.")
+        return
+
+    channels_col.update_one({"channel_id": ch_id}, {"$set": {"display_name": message.text.strip()}})
+    bot.send_message(ADMIN_ID, f"✅ Display name set to \"{message.text.strip()}\". Users will see this instead of the real channel title.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('editplans_'))
 def editplans(call):
