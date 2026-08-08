@@ -132,6 +132,7 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("✅ Yes, Extend", callback_data=f"extendyes_{ch_id}"))
             markup.add(InlineKeyboardButton("❌ No", callback_data="extendno"))
+            markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtolist"))
             send_page(chat_id,
                 f"ℹ️ You already have an active plan for <b>{esc(disp_name(ch_data))}</b>.\n\nStatus: {status_line}\n\nDo you want to buy more time and extend it?",
                 reply_markup=markup, parse_mode="HTML", force_new=force_new)
@@ -140,6 +141,7 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
     markup = InlineKeyboardMarkup()
     for p_time, p_val in ch_data['plans'].items():
         markup.add(InlineKeyboardButton(plan_button_text(p_time, p_val), callback_data=f"select_{ch_id}_{p_time}"))
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtolist"))
 
     if ch_data.get('description'):
         caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
@@ -168,9 +170,10 @@ def show_channel_list(chat_id):
     for ch in cursor:
         markup.add(InlineKeyboardButton(f"📢 {disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
         count += 1
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtostart"))
 
     if count == 0:
-        send_page(chat_id, "No channels are available for subscription right now. Please check back later.")
+        send_page(chat_id, "No channels are available for subscription right now. Please check back later.", reply_markup=markup)
     else:
         list_image_setting = settings_col.find_one({"key": "channel_list_image"})
         list_image = list_image_setting["value"] if list_image_setting and list_image_setting.get("value") else None
@@ -185,6 +188,16 @@ def get_welcome_image():
         return setting["value"]
     return WELCOME_IMAGE_URL
 
+def show_welcome(chat_id, first_name, force_new=False):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💎 BUY MEMBERSHIP", callback_data="buy_membership"))
+    caption = (f"👋 Welcome, {first_name}!\n\n"
+               f"I am your Premium Subscription Bot. 🤖\n"
+               f"I can help you get instant access to our exclusive premium channels.\n\n"
+               f"👇 Click on Buy Membership button below to browse our premium channel plans!")
+    welcome_image = get_welcome_image()
+    send_page(chat_id, caption, photo=welcome_image, reply_markup=markup, force_new=force_new)
+
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     text = message.text.split()
@@ -198,17 +211,20 @@ def start_handler(message):
                 return
         except: pass
 
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("💎 BUY MEMBERSHIP", callback_data="buy_membership"))
-    caption = (f"👋 Welcome, {message.from_user.first_name}!\n\n"
-               f"I am your Premium Subscription Bot. 🤖\n"
-               f"I can help you get instant access to our exclusive premium channels.\n\n"
-               f"👇 Click on Buy Membership button below to browse our premium channel plans!")
-    welcome_image = get_welcome_image()
-    send_page(message.chat.id, caption, photo=welcome_image, reply_markup=markup, force_new=True)
+    show_welcome(message.chat.id, message.from_user.first_name, force_new=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "buy_membership")
 def buy_membership(call):
+    bot.answer_callback_query(call.id)
+    show_channel_list(call.message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "backtostart")
+def backtostart(call):
+    bot.answer_callback_query(call.id)
+    show_welcome(call.message.chat.id, call.from_user.first_name)
+
+@bot.callback_query_handler(func=lambda call: call.data == "backtolist")
+def backtolist(call):
     bot.answer_callback_query(call.id)
     show_channel_list(call.message.chat.id)
 
@@ -595,17 +611,40 @@ def user_pays(call):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-    
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data=f"backtoplans_{ch_id}"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
+
     send_page(call.message.chat.id,
               f"Plan: {plan_label}\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.",
               photo=qr_url, reply_markup=markup, parse_mode="Markdown")
 
     pending_payments[call.from_user.id] = {"ch_id": int(ch_id), "mins": mins, "price": int(price)}
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith('backtoplans_'))
+def backtoplans(call):
+    bot.answer_callback_query(call.id)
+    ch_id = int(call.data.split('_')[1])
+    pending_payments.pop(call.from_user.id, None)
+    show_plans(call.message.chat.id, ch_id, user_id=call.from_user.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cancelpay_'))
+def cancelpay(call):
+    bot.answer_callback_query(call.id)
+    pending_payments.pop(call.from_user.id, None)
+    show_channel_list(call.message.chat.id)
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
 def ask_for_utr(call):
     bot.answer_callback_query(call.id)
-    send_page(call.message.chat.id, "🧾 Please send your 12-digit UTR / transaction reference number now to verify your payment.")
+    _, ch_id, mins = call.data.split('_')
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data=f"backtoplans_{ch_id}"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
+    # Sent as a fresh message (not via send_page) so the QR above stays visible instead of being replaced.
+    sent = bot.send_message(call.message.chat.id,
+        "🧾 Please send your 12-digit UTR / transaction reference number now to verify your payment.",
+        reply_markup=markup)
+    last_page_msg[call.message.chat.id] = {"message_id": sent.message_id, "has_photo": False}
 
 # --- BHARATPE UTR AUTO-VERIFICATION ---
 
