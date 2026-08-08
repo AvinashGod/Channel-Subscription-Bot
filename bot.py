@@ -611,7 +611,6 @@ def user_pays(call):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data=f"backtoplans_{ch_id}"))
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
 
     send_page(call.message.chat.id,
@@ -636,14 +635,9 @@ def cancelpay(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
 def ask_for_utr(call):
     bot.answer_callback_query(call.id)
-    _, ch_id, mins = call.data.split('_')
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data=f"backtoplans_{ch_id}"))
-    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
     # Sent as a fresh message (not via send_page) so the QR above stays visible instead of being replaced.
     sent = bot.send_message(call.message.chat.id,
-        "🧾 Please send your 12-digit UTR / transaction reference number now to verify your payment.",
-        reply_markup=markup)
+        "🧾 Please send your 12-digit UTR / transaction reference number now to verify your payment.")
     last_page_msg[call.message.chat.id] = {"message_id": sent.message_id, "has_photo": False}
 
 # --- BHARATPE UTR AUTO-VERIFICATION ---
