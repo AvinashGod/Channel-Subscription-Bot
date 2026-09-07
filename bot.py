@@ -136,7 +136,9 @@ def create_paytm_order(user_id, ch_id, mins, price):
         data = resp.json()
         txn_token = data.get("body", {}).get("txnToken")
         if not txn_token:
-            return None, None, data  # return raw response for debugging
+            # Include what we actually sent (safe to show — no secrets in the body itself) so it's easy to
+            # spot a wrong field/value rather than guessing blind from Paytm's vague error messages.
+            return None, None, {"paytm_response": data, "request_body_sent": body, "http_status": resp.status_code}
 
         paytm_orders_col.insert_one({
             "order_id": order_id, "user_id": user_id, "ch_id": ch_id, "mins": mins,
@@ -156,13 +158,13 @@ BHARATPE_TOKEN = os.getenv('BHARATPE_TOKEN')
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL')  # optional — shown on /start; falls back to text-only if not set
 
 # --- PAYTM CONFIG ---
-PAYTM_MID = os.getenv('PAYTM_MID')
-PAYTM_MERCHANT_KEY = os.getenv('PAYTM_MERCHANT_KEY')
-PAYTM_WEBSITE = os.getenv('PAYTM_WEBSITE', 'WEBSTAGING')  # WEBSTAGING for test mode
-PAYTM_ENV = os.getenv('PAYTM_ENV', 'TEST')  # TEST or PROD
+PAYTM_MID = (os.getenv('PAYTM_MID') or '').strip()
+PAYTM_MERCHANT_KEY = (os.getenv('PAYTM_MERCHANT_KEY') or '').strip()
+PAYTM_WEBSITE = (os.getenv('PAYTM_WEBSITE') or 'WEBSTAGING').strip()  # WEBSTAGING for test mode
+PAYTM_ENV = (os.getenv('PAYTM_ENV') or 'TEST').strip()  # TEST or PROD
 PAYTM_BASE_URL = "https://securegw-stage.paytm.in" if PAYTM_ENV == 'TEST' else "https://securegw.paytm.in"
 # Your Render service's public base URL, e.g. https://your-service-name.onrender.com (no trailing slash)
-PUBLIC_BASE_URL = os.getenv('PUBLIC_BASE_URL', '')
+PUBLIC_BASE_URL = (os.getenv('PUBLIC_BASE_URL') or '').strip().rstrip('/')
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = MongoClient(MONGO_URI)
