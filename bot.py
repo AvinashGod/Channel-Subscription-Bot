@@ -13,12 +13,138 @@ app = Flask('')
 @app.route('/')
 def home(): return "Bot is running and healthy!"
 
+@app.route('/pay/<order_id>')
+def paytm_pay_page(order_id):
+    from flask import abort
+    order = paytm_orders_col.find_one({"order_id": order_id})
+    if not order or not order.get("txn_token"):
+        abort(404)
+    txn_url = f"{PAYTM_BASE_URL}/theia/api/v1/showPaymentPage?mid={PAYTM_MID}&orderId={order_id}"
+    return f"""
+    <html><body onload="document.forms[0].submit()">
+    <form method="post" action="{txn_url}">
+        <input type="hidden" name="mid" value="{PAYTM_MID}">
+        <input type="hidden" name="orderId" value="{order_id}">
+        <input type="hidden" name="txnToken" value="{order['txn_token']}">
+    </form>
+    Redirecting to Paytm, please wait...
+    </body></html>
+    """
+
+@app.route('/paytm-callback', methods=['POST'])
+def paytm_callback():
+    from flask import request
+    data = request.form.to_dict()
+    checksum = data.pop('CHECKSUMHASH', None)
+    order_id = data.get('ORDERID')
+
+    order = paytm_orders_col.find_one({"order_id": order_id})
+    if not order:
+        return "Order not found", 404
+
+    # Paytm verifies callback checksums by sorting fields by key and concatenating VALUES ONLY
+    # (no delimiter between them) — different from how the initiate-request body is signed.
+    sorted_values = "".join(str(v) for k, v in sorted(data.items()))
+    valid = paytm_verify_signature(sorted_values, PAYTM_MERCHANT_KEY, checksum) if checksum else False
+
+    # Always tell the admin what came in while we're still verifying this integration works —
+    # safe to remove this line once you've confirmed real payments verify correctly.
+    bot.send_message(ADMIN_ID, f"🔍 Paytm callback received for order {order_id}. Signature valid: {valid}. Raw: {data}")
+
+    if not valid:
+        return "Invalid signature", 400
+
+    if data.get('STATUS') == 'TXN_SUCCESS' and order.get('status') == 'pending':
+        link, is_lifetime = create_access(order['user_id'], order['ch_id'], order['mins'])
+        paytm_orders_col.update_one({"order_id": order_id}, {"$set": {"status": "completed"}})
+        label = "Lifetime" if is_lifetime else f"{order['mins']} Minutes"
+        bot.send_message(order['user_id'],
+            f"🎉 <b>Payment Verified via Paytm!</b>\n\nSubscription: {label}\n\nJoin Link: {link.invite_link}",
+            parse_mode="HTML")
+        bot.send_message(ADMIN_ID, f"✅ Paytm auto-approved user {order['user_id']} for order {order_id} (₹{order['price']}).")
+    elif order.get('status') == 'pending':
+        paytm_orders_col.update_one({"order_id": order_id}, {"$set": {"status": "failed"}})
+        bot.send_message(order['user_id'], "❌ Your Paytm payment did not complete successfully. Please try again.")
+
+    return "OK"
+
 def run_web():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     Thread(target=run_web).start()
+
+# --- PAYTM CHECKSUM (standard Paytm v1 signature algorithm: SHA256 + AES-CBC, static IV) ---
+import hashlib, base64, random, string, json as _json
+from Crypto.Cipher import AES
+
+_PAYTM_IV = "@@@@&&&&####$$$$"  # Paytm's fixed IV, same across all official SDKs
+
+def _paytm_pad(data):
+    pad_len = 16 - (len(data) % 16)
+    return data + chr(pad_len) * pad_len
+
+def _paytm_unpad(data):
+    pad_len = ord(data[-1])
+    return data[:-pad_len]
+
+def paytm_generate_signature(params_str, key):
+    salt = ''.join(random.choices(string.ascii_letters + string.digits, k=4))
+    final_string = params_str + "|" + salt
+    hash_str = hashlib.sha256(final_string.encode('utf-8')).hexdigest()
+    to_encrypt = _paytm_pad(hash_str + salt)
+    cipher = AES.new(key.encode('utf-8'), AES.MODE_CBC, _PAYTM_IV.encode('utf-8'))
+    encrypted = cipher.encrypt(to_encrypt.encode('utf-8'))
+    return base64.b64encode(encrypted).decode('utf-8')
+
+def paytm_verify_signature(params_str, key, checksum):
+    try:
+        encrypted = base64.b64decode(checksum)
+        cipher = AES.new(key.encode('utf-8'), AES.MODE_CBC, _PAYTM_IV.encode('utf-8'))
+        decrypted = _paytm_unpad(cipher.decrypt(encrypted).decode('utf-8'))
+        salt = decrypted[-4:]
+        hash_str = decrypted[:-4]
+        expected = hashlib.sha256((params_str + "|" + salt).encode('utf-8')).hexdigest()
+        return expected == hash_str
+    except Exception:
+        return False
+
+def create_paytm_order(user_id, ch_id, mins, price):
+    """Creates a Paytm order + txnToken. Returns (order_id, txn_token) or (None, None) on failure."""
+    order_id = f"ORDER_{user_id}_{int(datetime.now().timestamp())}"
+    callback_url = f"{PUBLIC_BASE_URL}/paytm-callback"
+
+    body = {
+        "requestType": "Payment",
+        "mid": PAYTM_MID,
+        "websiteName": PAYTM_WEBSITE,
+        "orderId": order_id,
+        "callbackUrl": callback_url,
+        "txnAmount": {"value": str(price), "currency": "INR"},
+        "userInfo": {"custId": str(user_id)}
+    }
+    body_str = _json.dumps(body, separators=(',', ':'))
+    signature = paytm_generate_signature(body_str, PAYTM_MERCHANT_KEY)
+    payload = {"body": body, "head": {"signature": signature}}
+
+    try:
+        resp = requests.post(
+            f"{PAYTM_BASE_URL}/theia/api/v1/initiateTransaction?mid={PAYTM_MID}&orderId={order_id}",
+            json=payload, timeout=15
+        )
+        data = resp.json()
+        txn_token = data.get("body", {}).get("txnToken")
+        if not txn_token:
+            return None, None, data  # return raw response for debugging
+
+        paytm_orders_col.insert_one({
+            "order_id": order_id, "user_id": user_id, "ch_id": ch_id, "mins": mins,
+            "price": price, "status": "pending", "txn_token": txn_token, "created_at": datetime.now()
+        })
+        return order_id, txn_token, None
+    except Exception as e:
+        return None, None, {"error": str(e)}
 
 # --- CONFIGURATION (Environment Variables) ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -29,6 +155,15 @@ CONTACT_USERNAME = os.getenv('CONTACT_USERNAME')
 BHARATPE_TOKEN = os.getenv('BHARATPE_TOKEN')
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL')  # optional — shown on /start; falls back to text-only if not set
 
+# --- PAYTM CONFIG ---
+PAYTM_MID = os.getenv('PAYTM_MID')
+PAYTM_MERCHANT_KEY = os.getenv('PAYTM_MERCHANT_KEY')
+PAYTM_WEBSITE = os.getenv('PAYTM_WEBSITE', 'WEBSTAGING')  # WEBSTAGING for test mode
+PAYTM_ENV = os.getenv('PAYTM_ENV', 'TEST')  # TEST or PROD
+PAYTM_BASE_URL = "https://securegw-stage.paytm.in" if PAYTM_ENV == 'TEST' else "https://securegw.paytm.in"
+# Your Render service's public base URL, e.g. https://your-service-name.onrender.com (no trailing slash)
+PUBLIC_BASE_URL = os.getenv('PUBLIC_BASE_URL', '')
+
 bot = telebot.TeleBot(BOT_TOKEN)
 client = MongoClient(MONGO_URI)
 db = client['sub_management']
@@ -36,6 +171,7 @@ channels_col = db['channels']
 users_col = db['users']
 used_utrs_col = db['used_utrs']  # permanent record of spent UTRs, never touched by kick_expired_users
 settings_col = db['settings']  # small key/value store for things like the welcome image
+paytm_orders_col = db['paytm_orders']  # tracks orderId -> {user_id, ch_id, mins, price, status}
 
 # In-memory tracker: user_id -> {"ch_id":.., "mins":.., "price":..}
 pending_payments = {}
@@ -86,6 +222,48 @@ import html as _html
 
 def esc(s):
     return _html.escape(str(s))
+
+def entities_to_html(text, entities):
+    """Converts a Telegram message's text + entities into an HTML string safe to embed in our own
+    HTML-formatted messages, preserving premium custom emoji (via <tg-emoji>) and basic bold/italic/etc.
+    Falls back to plain escaped text if there are no entities."""
+    if not text:
+        return ""
+    if not entities:
+        return esc(text)
+
+    tag_map = {
+        'bold': 'b', 'italic': 'i', 'underline': 'u', 'strikethrough': 's',
+        'code': 'code', 'spoiler': 'tg-spoiler',
+    }
+
+    # Telegram entity offsets/lengths are in UTF-16 code units, so work on a UTF-16 buffer
+    # to stay correct even when the text contains surrogate-pair emoji.
+    buf = text.encode('utf-16-le')
+
+    def slice_utf16(start_units, end_units):
+        return buf[start_units * 2:end_units * 2].decode('utf-16-le')
+
+    # Only handle non-overlapping, non-nested entities here — plenty for short admin-typed text.
+    sorted_entities = sorted(entities, key=lambda e: e.offset)
+    result = []
+    cursor = 0
+    for ent in sorted_entities:
+        if ent.offset < cursor:
+            continue  # skip overlapping entity we can't cleanly represent
+        result.append(esc(slice_utf16(cursor, ent.offset)))
+        segment = slice_utf16(ent.offset, ent.offset + ent.length)
+        if ent.type == 'custom_emoji' and getattr(ent, 'custom_emoji_id', None):
+            result.append(f'<tg-emoji emoji-id="{esc(ent.custom_emoji_id)}">{esc(segment)}</tg-emoji>')
+        elif ent.type in tag_map:
+            tag = tag_map[ent.type]
+            result.append(f'<{tag}>{esc(segment)}</{tag}>')
+        else:
+            result.append(esc(segment))
+        cursor = ent.offset + ent.length
+
+    result.append(esc(slice_utf16(cursor, len(buf) // 2)))
+    return "".join(result)
 
 def disp_name(ch_data):
     """Returns the admin-set display name if one is configured, otherwise the real Telegram channel title."""
@@ -145,7 +323,7 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
 
     if ch_data.get('description'):
         caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
-                   f"<blockquote>{esc(ch_data['description'])}</blockquote>\n\n"
+                   f"<blockquote>{ch_data['description']}</blockquote>\n\n"
                    f"Please select a subscription plan below:")
     else:
         caption = f"Welcome!\n\nYou are joining: <b>{esc(disp_name(ch_data))}</b>.\n\nPlease select a subscription plan below:"
@@ -168,7 +346,7 @@ def show_channel_list(chat_id):
     cursor = channels_col.find({})
     count = 0
     for ch in cursor:
-        markup.add(InlineKeyboardButton(f"{disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
+        markup.add(InlineKeyboardButton(f"📢 {disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
         count += 1
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtostart"))
 
@@ -420,7 +598,8 @@ def do_broadcast(message):
     sent, failed = 0, 0
     for uid in recipients:
         try:
-            bot.send_message(uid, message.text)
+            # Passing entities directly preserves any premium emoji, bold, links, etc. the admin used while typing
+            bot.send_message(uid, message.text, entities=message.entities)
             sent += 1
         except Exception:
             failed += 1
@@ -602,22 +781,65 @@ def user_pays(call):
     ch_data = channels_col.find_one({"channel_id": int(ch_id)})
     price, custom_label = plan_info(ch_data['plans'][mins])
 
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={price}%26cu=INR"
     if custom_label:
         plan_label = custom_label
     else:
         plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
 
+    pending_payments[call.from_user.id] = {"ch_id": int(ch_id), "mins": mins, "price": int(price)}
+
+    # If Paytm isn't configured yet, skip straight to the existing UPI/QR flow — nothing changes
+    # for you until PAYTM_MID and PAYTM_MERCHANT_KEY are actually set in Render.
+    if not (PAYTM_MID and PAYTM_MERCHANT_KEY):
+        show_upi_qr(call.message.chat.id, ch_id, mins, price, plan_label)
+        return
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💳 Pay via Paytm (Card/UPI/Wallet)", callback_data=f"paypaytm_{ch_id}_{mins}"))
+    markup.add(InlineKeyboardButton("📱 Pay via UPI QR", callback_data=f"payupi_{ch_id}_{mins}"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
+    send_page(call.message.chat.id, f"Plan: {plan_label}\nPrice: ₹{price}\n\nChoose how you'd like to pay:", reply_markup=markup)
+
+def show_upi_qr(chat_id, ch_id, mins, price, plan_label):
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={price}%26cu=INR"
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
-
-    send_page(call.message.chat.id,
+    send_page(chat_id,
               f"Plan: {plan_label}\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.",
               photo=qr_url, reply_markup=markup, parse_mode="Markdown")
 
-    pending_payments[call.from_user.id] = {"ch_id": int(ch_id), "mins": mins, "price": int(price)}
+@bot.callback_query_handler(func=lambda call: call.data.startswith('payupi_'))
+def payupi(call):
+    bot.answer_callback_query(call.id)
+    _, ch_id, mins = call.data.split('_')
+    ch_data = channels_col.find_one({"channel_id": int(ch_id)})
+    price, custom_label = plan_info(ch_data['plans'][mins])
+    plan_label = custom_label if custom_label else ("Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes")
+    show_upi_qr(call.message.chat.id, ch_id, mins, price, plan_label)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('paypaytm_'))
+def paypaytm(call):
+    bot.answer_callback_query(call.id)
+    _, ch_id, mins = call.data.split('_')
+    ch_id = int(ch_id)
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    price, _ = plan_info(ch_data['plans'][mins])
+
+    order_id, txn_token, error = create_paytm_order(call.from_user.id, ch_id, mins, int(price))
+    if not order_id:
+        bot.send_message(call.message.chat.id, "⚠️ Couldn't start the Paytm payment right now. Please try UPI QR instead, or contact admin.")
+        bot.send_message(ADMIN_ID, f"❌ Paytm order creation failed for user {call.from_user.id}: {error}")
+        return
+
+    pay_url = f"{PUBLIC_BASE_URL}/pay/{order_id}"
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💳 Pay Now", url=pay_url))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
+    send_page(call.message.chat.id,
+              f"Price: ₹{price}\n\nTap below to complete your payment via Paytm. You'll be redirected automatically once payment succeeds — no need to send any UTR.",
+              reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('backtoplans_'))
 def backtoplans(call):
@@ -773,7 +995,9 @@ def setdesc(call):
     bot.answer_callback_query(call.id)
     ch_id = int(call.data.split('_')[1])
     msg = bot.send_message(call.message.chat.id,
-        "📝 Send the channel details text you want shown to users (features, what's included, etc.) before they pick a plan.\n\nSend /cancel to abort, or /remove to clear it.")
+        "📝 Send the channel details text you want shown to users (features, what's included, etc.) before they pick a plan.\n\n"
+        "💎 If you have Telegram Premium, you can use Premium emoji in this message and they'll be preserved for other Premium users (non-Premium users see the regular fallback emoji instead).\n\n"
+        "Send /cancel to abort, or /remove to clear it.")
     bot.register_next_step_handler(msg, process_setdesc, ch_id)
 
 def process_setdesc(message, ch_id):
@@ -788,7 +1012,8 @@ def process_setdesc(message, ch_id):
         bot.send_message(ADMIN_ID, "❌ That wasn't text. Try again via /channels, or send /cancel.")
         return
 
-    channels_col.update_one({"channel_id": ch_id}, {"$set": {"description": message.text}})
+    html_description = entities_to_html(message.text, message.entities or [])
+    channels_col.update_one({"channel_id": ch_id}, {"$set": {"description": html_description}})
     bot.send_message(ADMIN_ID, "✅ Channel details updated! It'll show the next time someone views this channel's plans.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('setchimg_'))
