@@ -3,3 +3,4 @@ pymongo[srv]
 apscheduler
 flask
 requests
+pycryptodome
