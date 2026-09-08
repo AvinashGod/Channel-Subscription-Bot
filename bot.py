@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request
 from threading import Thread
+from io import BytesIO
 
 # --- RENDER KEEP-ALIVE SERVER ---
 app = Flask('')
@@ -649,7 +650,8 @@ def user_pays(call):
     payment = data["data"]
     payment_id = payment.get("payment_id")
     pay_url = payment.get("pay_url") or payment.get("upi_link")
-    if not payment_id or not pay_url:
+    qr_code = payment.get("qr_code")
+    if not payment_id or not qr_code:
         bot.send_message(ADMIN_ID, f"❌ UPIQRPay returned an incomplete order response: {data}")
         bot.send_message(call.message.chat.id, "⚠️ Payment order could not be created. Please contact admin.")
         return
@@ -659,9 +661,18 @@ def user_pays(call):
     else:
         plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
 
-    # Generate a QR from the UPIQRPay payment URL while keeping the actual order/payment
-    # tied to UPIQRPay. The status API below is used for verification.
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={requests.utils.quote(pay_url, safe='')}"
+    # Use the actual payment QR returned by UPIQRPay.
+    # Do NOT generate a QR from pay_url: pay_url opens a web payment page and
+    # phone QR scanners can correctly report that it is not a payment QR.
+    try:
+        qr_data = qr_code.split(',', 1)[1] if ',' in qr_code else qr_code
+        qr_bytes = base64.b64decode(qr_data)
+        qr_photo = BytesIO(qr_bytes)
+        qr_photo.name = "upiqrpay_qr.png"
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Invalid QR returned by UPIQRPay for payment {payment_id}: {e}")
+        bot.send_message(call.message.chat.id, "⚠️ Payment QR could not be loaded. Please try again.")
+        return
 
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("💳 Pay Now", url=pay_url))
@@ -669,8 +680,8 @@ def user_pays(call):
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
 
     send_page(call.message.chat.id,
-              f"Plan: {plan_label}\nPrice: ₹{price}\n\nScan the QR or tap 'Pay Now' to complete the payment.\n\nAfter payment, tap 'I Have Paid'.",
-              photo=qr_url, reply_markup=markup, parse_mode="Markdown")
+              f"Plan: {plan_label}\nPrice: ₹{price}\n\nScan this QR to pay or tap 'Pay Now' to complete the payment.\n\nAfter payment, tap 'I Have Paid'.",
+              photo=qr_photo, reply_markup=markup, parse_mode="Markdown")
 
     pending_payments[call.from_user.id] = {
         "ch_id": ch_id,
