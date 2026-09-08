@@ -10,7 +10,7 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request
-from threading import Thread
+from threading import Thread, Lock
 from io import BytesIO
 
 # --- RENDER KEEP-ALIVE SERVER ---
@@ -46,6 +46,8 @@ settings_col = db['settings']  # small key/value store for things like the welco
 
 # In-memory tracker: user_id -> {"ch_id":.., "mins":.., "price":..}
 pending_payments = {}
+payment_processing = set()
+payment_lock = Lock()
 
 # Tracks the last "navigation" message per chat: {"message_id": ..., "has_photo": bool}
 # so a button tap can edit it in place, while a typed command still deletes and sends fresh.
@@ -675,12 +677,11 @@ def user_pays(call):
         return
 
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("💳 Pay Now", url=pay_url))
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{payment_id}"))
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
 
     send_page(call.message.chat.id,
-              f"Plan: {plan_label}\nPrice: ₹{price}\n\nScan this QR to pay or tap 'Pay Now' to complete the payment.\n\nAfter payment, tap 'I Have Paid'.",
+              f"Plan: {plan_label}\nPrice: ₹{price}\n\nScan this QR to pay.\n\n✅ Payment is checked automatically every 5 seconds. You don't need to tap anything after paying.",
               photo=qr_photo, reply_markup=markup, parse_mode="Markdown")
 
     pending_payments[call.from_user.id] = {
@@ -704,13 +705,154 @@ def cancelpay(call):
     pending_payments.pop(call.from_user.id, None)
     show_channel_list(call.message.chat.id)
 
+def _upiqrpay_status(payment_id):
+    """Return (status_data, error). Never raises to callers."""
+    try:
+        resp = requests.get(
+            f"https://upiqrpay.in/api/v1/order/status/{requests.utils.quote(str(payment_id), safe='')}",
+            headers={"Authorization": f"Bearer {UPIQRPAY_API_KEY}"},
+            timeout=10
+        )
+        return resp.json(), None
+    except Exception as e:
+        return None, e
+
+
+def complete_successful_payment(user_id, plan, payment, source="manual"):
+    """Verify amount/UTR and grant access exactly once."""
+    payment_id = str(plan.get("payment_id"))
+
+    # Prevent the 5-second background checker and a simultaneous button tap
+    # from granting the same order twice.
+    with payment_lock:
+        if user_id in payment_processing:
+            return False
+        payment_processing.add(user_id)
+
+    try:
+        paid_amount = payment.get("amount", plan["price"])
+        try:
+            paid_amount_num = int(float(paid_amount))
+        except (TypeError, ValueError):
+            paid_amount_num = -1
+
+        if paid_amount_num != int(plan["price"]):
+            bot.send_message(
+                user_id,
+                f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{plan['price']}. Contact admin."
+            )
+            bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{plan['price']}, payment {payment_id}"
+            )
+            return False
+
+        utr = str(payment.get("utr_number") or payment.get("utr") or payment_id)
+        if used_utrs_col.find_one({"utr": utr}):
+            pending_payments.pop(user_id, None)
+            return False
+
+        ch_id, mins = plan["ch_id"], plan["mins"]
+        link, is_lifetime = create_access(user_id, ch_id, mins)
+
+        # Record the payment before notifying the user. The unique UTR check
+        # above plus payment_lock prevents duplicate grants in this process.
+        try:
+            used_utrs_col.insert_one({
+                "utr": utr,
+                "payment_id": payment_id,
+                "order_id": payment.get("order_id", plan.get("order_id")),
+                "user_id": user_id,
+                "ch_id": ch_id,
+                "amount": paid_amount_num,
+                "used_at": datetime.now()
+            })
+        except Exception:
+            # A duplicate-key/index race should not result in another credit.
+            if used_utrs_col.find_one({"utr": utr}):
+                pending_payments.pop(user_id, None)
+                return False
+            raise
+
+        if is_lifetime:
+            msg_text = (
+                "🎉 <b>Payment Verified!</b>\n\n"
+                "Subscription: Lifetime Membership ♾️\n\n"
+                f"Join Link: {link.invite_link}\n\n"
+                "✅ This is a lifetime membership — no expiry!"
+            )
+        else:
+            msg_text = (
+                "🎉 <b>Payment Verified!</b>\n\n"
+                f"Subscription: {mins} Minutes\n\n"
+                f"Join Link: {link.invite_link}\n\n"
+                f"⚠️ Note: This link and your access will expire in {mins} minutes."
+            )
+
+        bot.send_message(user_id, msg_text, parse_mode="HTML")
+        bot.send_message(
+            ADMIN_ID,
+            f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount})."
+        )
+        pending_payments.pop(user_id, None)
+        return True
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Error during UPIQRPay auto-approval for user {user_id}, payment {payment_id}: {e}")
+        return False
+    finally:
+        with payment_lock:
+            payment_processing.discard(user_id)
+
+
+def check_pending_payment(user_id, plan, notify_expired=True):
+    """Check one pending UPIQRPay order and automatically complete it if paid."""
+    if not plan or not UPIQRPAY_API_KEY:
+        return
+
+    payment_id = plan.get("payment_id")
+    if not payment_id:
+        return
+
+    # Ignore stale/replaced payment sessions.
+    current = pending_payments.get(user_id)
+    if current is not plan and str((current or {}).get("payment_id")) != str(payment_id):
+        return
+
+    data, error = _upiqrpay_status(payment_id)
+    if error or not data or not data.get("success") or not data.get("data"):
+        return
+
+    payment = data["data"]
+    status = str(payment.get("status", "")).lower()
+
+    if status == "success":
+        complete_successful_payment(user_id, plan, payment, source="auto")
+    elif status in ("expired", "cancelled"):
+        if pending_payments.get(user_id) is plan or str((pending_payments.get(user_id) or {}).get("payment_id")) == str(payment_id):
+            pending_payments.pop(user_id, None)
+            if notify_expired:
+                try:
+                    bot.send_message(user_id, f"❌ Payment status: {status}. Please start a new payment.")
+                except Exception:
+                    pass
+
+
+def auto_check_pending_payments():
+    """Poll every pending order. Runs in APScheduler's background thread."""
+    for user_id, plan in list(pending_payments.items()):
+        try:
+            check_pending_payment(user_id, plan, notify_expired=True)
+        except Exception:
+            pass
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
 def verify_payment_status(call):
     bot.answer_callback_query(call.id, "Checking payment…")
     user_id = call.from_user.id
     plan = pending_payments.get(user_id)
     if not plan:
-        bot.send_message(call.message.chat.id, "⚠️ No pending payment was found. Please start the payment again.")
+        bot.send_message(call.message.chat.id, "⚠️ No pending payment was found. If payment was already completed, your join link should have been sent automatically.")
         return
 
     payment_id = call.data.split('_', 1)[1]
@@ -718,16 +860,10 @@ def verify_payment_status(call):
         bot.send_message(call.message.chat.id, "⚠️ Payment session mismatch. Please start the payment again.")
         return
 
-    try:
-        resp = requests.get(
-            f"https://upiqrpay.in/api/v1/order/status/{requests.utils.quote(str(payment_id), safe='')}",
-            headers={"Authorization": f"Bearer {UPIQRPAY_API_KEY}"},
-            timeout=15
-        )
-        data = resp.json()
-    except Exception as e:
+    data, error = _upiqrpay_status(payment_id)
+    if error:
         bot.send_message(call.message.chat.id, "⚠️ Payment verification service is unavailable right now. Please try again in a minute.")
-        bot.send_message(ADMIN_ID, f"❌ UPIQRPay status check failed for user {user_id}, payment {payment_id}: {e}")
+        bot.send_message(ADMIN_ID, f"❌ UPIQRPay status check failed for user {user_id}, payment {payment_id}: {error}")
         return
 
     if not data.get("success") or not data.get("data"):
@@ -738,7 +874,7 @@ def verify_payment_status(call):
     status = str(payment.get("status", "")).lower()
 
     if status == "pending":
-        bot.send_message(call.message.chat.id, "⏳ Payment is still pending. If you have already paid, wait a little and tap 'I Have Paid' again.")
+        bot.send_message(call.message.chat.id, "⏳ Payment is still pending. The bot will keep checking automatically every 5 seconds.")
         return
 
     if status in ("expired", "cancelled"):
@@ -750,43 +886,7 @@ def verify_payment_status(call):
         bot.send_message(call.message.chat.id, f"⚠️ Payment status: {status or 'unknown'}. Please try again or contact admin.")
         return
 
-    paid_amount = payment.get("amount", plan["price"])
-    if int(float(paid_amount)) != int(plan["price"]):
-        bot.send_message(call.message.chat.id, f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{plan['price']}. Contact admin.")
-        bot.send_message(ADMIN_ID, f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{plan['price']}, payment {payment_id}")
-        return
-
-    # Use the UTR returned by UPIQRPay, if available, to prevent the same payment
-    # from being credited twice. Fall back to payment_id when UTR is absent.
-    utr = str(payment.get("utr_number") or payment.get("utr") or payment_id)
-    if used_utrs_col.find_one({"utr": utr}):
-        bot.send_message(call.message.chat.id, "⚠️ This payment has already been credited.")
-        pending_payments.pop(user_id, None)
-        return
-
-    ch_id, mins = plan["ch_id"], plan["mins"]
-    try:
-        link, is_lifetime = create_access(user_id, ch_id, mins)
-        used_utrs_col.insert_one({
-            "utr": utr,
-            "payment_id": payment_id,
-            "order_id": payment.get("order_id", plan.get("order_id")),
-            "user_id": user_id,
-            "ch_id": ch_id,
-            "amount": int(float(paid_amount)),
-            "used_at": datetime.now()
-        })
-
-        if is_lifetime:
-            msg_text = f"🎉 <b>Payment Verified!</b>\n\nSubscription: Lifetime Membership ♾️\n\nJoin Link: {link.invite_link}\n\n✅ This is a lifetime membership — no expiry!"
-        else:
-            msg_text = f"🎉 <b>Payment Verified!</b>\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes."
-
-        bot.send_message(user_id, msg_text, parse_mode="HTML")
-        bot.send_message(ADMIN_ID, f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount}).")
-        pending_payments.pop(user_id, None)
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Error during UPIQRPay auto-approval: {e}")
+    complete_successful_payment(user_id, plan, payment, source="manual")
 
 
 @app.route('/payment-return')
@@ -834,11 +934,8 @@ def upiqrpay_webhook():
                 status_data = resp.json()
                 payment = status_data.get("data", {})
                 if status_data.get("success") and str(payment.get("status", '')).lower() == 'success':
-                    # The user can press I Have Paid to complete the Telegram-side credit.
-                    try:
-                        bot.send_message(user_id, "✅ Payment received! Tap 'I Have Paid' on the payment message to verify and get your join link.")
-                    except Exception:
-                        pass
+                    # Complete automatically when the signed webhook reports success.
+                    check_pending_payment(user_id, plan, notify_expired=False)
             except Exception:
                 pass
             break
@@ -1040,6 +1137,7 @@ if __name__ == '__main__':
     keep_alive()
     scheduler = BackgroundScheduler()
     scheduler.add_job(kick_expired_users, 'interval', minutes=1)
+    scheduler.add_job(auto_check_pending_payments, 'interval', seconds=5, max_instances=1, coalesce=True)
     scheduler.add_job(daily_summary, 'cron', hour=23, minute=59)
     scheduler.start()
     bot.remove_webhook()
