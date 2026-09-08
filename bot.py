@@ -1,11 +1,15 @@
 import os
 import requests
+import uuid
+import base64
+import hmac
+import hashlib
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask
+from flask import Flask, request
 from threading import Thread
 
 # --- RENDER KEEP-ALIVE SERVER ---
@@ -26,7 +30,9 @@ MONGO_URI = os.getenv('MONGO_URI')
 ADMIN_ID = int(os.getenv('ADMIN_ID'))
 UPI_ID = os.getenv('UPI_ID')
 CONTACT_USERNAME = os.getenv('CONTACT_USERNAME')
-BHARATPE_TOKEN = os.getenv('BHARATPE_TOKEN')
+UPIQRPAY_API_KEY = os.getenv('UPIQRPAY_API_KEY')
+UPIQRPAY_WEBHOOK_SECRET = os.getenv('UPIQRPAY_WEBHOOK_SECRET')
+PUBLIC_BASE_URL = os.getenv('PUBLIC_BASE_URL')  # e.g. https://your-bot.onrender.com
 WELCOME_IMAGE_URL = os.getenv('WELCOME_IMAGE_URL')  # optional — shown on /start; falls back to text-only if not set
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -598,26 +604,81 @@ def create_access(user_id, ch_id, mins):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('select_'))
 def user_pays(call):
+    bot.answer_callback_query(call.id)
     _, ch_id, mins = call.data.split('_')
-    ch_data = channels_col.find_one({"channel_id": int(ch_id)})
-    price, custom_label = plan_info(ch_data['plans'][mins])
+    ch_id = int(ch_id)
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    if not ch_data or mins not in ch_data.get('plans', {}):
+        bot.send_message(call.message.chat.id, "❌ This plan is no longer available. Please try again.")
+        return
 
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={price}%26cu=INR"
+    price, custom_label = plan_info(ch_data['plans'][mins])
+    price = int(price)
+    order_id = f"TG_{call.from_user.id}_{uuid.uuid4().hex[:12]}"
+
+    payload = {
+        "amount": price,
+        "order_id": order_id,
+        "customer_name": call.from_user.first_name or "Telegram User",
+        "customer_phone": "9999999999",
+    }
+    if PUBLIC_BASE_URL:
+        payload["redirect_url"] = PUBLIC_BASE_URL.rstrip('/') + "/payment-return"
+        payload["webhook_url"] = PUBLIC_BASE_URL.rstrip('/') + "/webhook/upiqrpay"
+
+    try:
+        resp = requests.post(
+            "https://upiqrpay.in/api/v1/order/create",
+            headers={
+                "Authorization": f"Bearer {UPIQRPAY_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15
+        )
+        data = resp.json()
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ UPIQRPay order creation failed for user {call.from_user.id}: {e}")
+        bot.send_message(call.message.chat.id, "⚠️ Payment service is temporarily unavailable. Please try again in a moment.")
+        return
+
+    if not data.get("success") or not data.get("data"):
+        bot.send_message(call.message.chat.id, f"❌ Could not create payment order: {data.get('message', 'Unknown error')}")
+        return
+
+    payment = data["data"]
+    payment_id = payment.get("payment_id")
+    pay_url = payment.get("pay_url") or payment.get("upi_link")
+    if not payment_id or not pay_url:
+        bot.send_message(ADMIN_ID, f"❌ UPIQRPay returned an incomplete order response: {data}")
+        bot.send_message(call.message.chat.id, "⚠️ Payment order could not be created. Please contact admin.")
+        return
+
     if custom_label:
         plan_label = custom_label
     else:
         plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
 
+    # Generate a QR from the UPIQRPay payment URL while keeping the actual order/payment
+    # tied to UPIQRPay. The status API below is used for verification.
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={requests.utils.quote(pay_url, safe='')}"
+
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}"))
-    markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
+    markup.add(InlineKeyboardButton("💳 Pay Now", url=pay_url))
+    markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{payment_id}"))
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
 
     send_page(call.message.chat.id,
-              f"Plan: {plan_label}\nPrice: ₹{price}\nUPI ID: `{UPI_ID}`\n\nPlease complete the payment and click 'I Have Paid'.",
+              f"Plan: {plan_label}\nPrice: ₹{price}\n\nScan the QR or tap 'Pay Now' to complete the payment.\n\nAfter payment, tap 'I Have Paid'.",
               photo=qr_url, reply_markup=markup, parse_mode="Markdown")
 
-    pending_payments[call.from_user.id] = {"ch_id": int(ch_id), "mins": mins, "price": int(price)}
+    pending_payments[call.from_user.id] = {
+        "ch_id": ch_id,
+        "mins": mins,
+        "price": price,
+        "payment_id": payment_id,
+        "order_id": payment.get("order_id", order_id),
+    }
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('backtoplans_'))
 def backtoplans(call):
@@ -633,53 +694,77 @@ def cancelpay(call):
     show_channel_list(call.message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
-def ask_for_utr(call):
-    bot.answer_callback_query(call.id)
-    # Sent as a fresh message (not via send_page) so the QR above stays visible instead of being replaced.
-    sent = bot.send_message(call.message.chat.id,
-        "🧾 Please send your 12-digit UTR / transaction reference number now to verify your payment.")
-    last_page_msg[call.message.chat.id] = {"message_id": sent.message_id, "has_photo": False}
-
-# --- BHARATPE UTR AUTO-VERIFICATION ---
-
-@bot.message_handler(func=lambda msg: msg.from_user.id in pending_payments and msg.text and msg.text.strip().isdigit())
-def verify_utr(msg):
-    user_id = msg.from_user.id
-    utr = msg.text.strip()
+def verify_payment_status(call):
+    bot.answer_callback_query(call.id, "Checking payment…")
+    user_id = call.from_user.id
     plan = pending_payments.get(user_id)
     if not plan:
+        bot.send_message(call.message.chat.id, "⚠️ No pending payment was found. Please start the payment again.")
         return
 
-    if used_utrs_col.find_one({"utr": utr}):
-        bot.reply_to(msg, "⚠️ This UTR has already been used for a previous approval.")
+    payment_id = call.data.split('_', 1)[1]
+    if str(plan.get("payment_id")) != str(payment_id):
+        bot.send_message(call.message.chat.id, "⚠️ Payment session mismatch. Please start the payment again.")
         return
 
     try:
         resp = requests.get(
-            "https://bharatpe-payment-checker.vercel.app/check",
-            params={"token": BHARATPE_TOKEN, "utr": utr},
-            timeout=10
+            f"https://upiqrpay.in/api/v1/order/status/{requests.utils.quote(str(payment_id), safe='')}",
+            headers={"Authorization": f"Bearer {UPIQRPAY_API_KEY}"},
+            timeout=15
         )
         data = resp.json()
     except Exception as e:
-        bot.reply_to(msg, "⚠️ Verification service unavailable right now. Please try again in a minute, or contact admin.")
-        bot.send_message(ADMIN_ID, f"UTR check failed for user {user_id}, utr {utr}: {e}")
+        bot.send_message(call.message.chat.id, "⚠️ Payment verification service is unavailable right now. Please try again in a minute.")
+        bot.send_message(ADMIN_ID, f"❌ UPIQRPay status check failed for user {user_id}, payment {payment_id}: {e}")
         return
 
-    if not data.get("success"):
-        bot.reply_to(msg, f"❌ {data.get('message', 'UTR not found yet. Wait a minute and resend, or contact admin.')}")
+    if not data.get("success") or not data.get("data"):
+        bot.send_message(call.message.chat.id, f"❌ {data.get('message', 'Could not check payment status.')}")
         return
 
-    paid_amount = data["data"]["amount"]
-    if int(paid_amount) != int(plan["price"]):
-        bot.reply_to(msg, f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{plan['price']}. Contact admin.")
-        bot.send_message(ADMIN_ID, f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{plan['price']}, utr {utr}")
+    payment = data["data"]
+    status = str(payment.get("status", "")).lower()
+
+    if status == "pending":
+        bot.send_message(call.message.chat.id, "⏳ Payment is still pending. If you have already paid, wait a little and tap 'I Have Paid' again.")
+        return
+
+    if status in ("expired", "cancelled"):
+        bot.send_message(call.message.chat.id, f"❌ Payment status: {status}. Please start a new payment.")
+        pending_payments.pop(user_id, None)
+        return
+
+    if status != "success":
+        bot.send_message(call.message.chat.id, f"⚠️ Payment status: {status or 'unknown'}. Please try again or contact admin.")
+        return
+
+    paid_amount = payment.get("amount", plan["price"])
+    if int(float(paid_amount)) != int(plan["price"]):
+        bot.send_message(call.message.chat.id, f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{plan['price']}. Contact admin.")
+        bot.send_message(ADMIN_ID, f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{plan['price']}, payment {payment_id}")
+        return
+
+    # Use the UTR returned by UPIQRPay, if available, to prevent the same payment
+    # from being credited twice. Fall back to payment_id when UTR is absent.
+    utr = str(payment.get("utr_number") or payment.get("utr") or payment_id)
+    if used_utrs_col.find_one({"utr": utr}):
+        bot.send_message(call.message.chat.id, "⚠️ This payment has already been credited.")
+        pending_payments.pop(user_id, None)
         return
 
     ch_id, mins = plan["ch_id"], plan["mins"]
     try:
         link, is_lifetime = create_access(user_id, ch_id, mins)
-        used_utrs_col.insert_one({"utr": utr, "user_id": user_id, "ch_id": ch_id, "amount": paid_amount, "used_at": datetime.now()})
+        used_utrs_col.insert_one({
+            "utr": utr,
+            "payment_id": payment_id,
+            "order_id": payment.get("order_id", plan.get("order_id")),
+            "user_id": user_id,
+            "ch_id": ch_id,
+            "amount": int(float(paid_amount)),
+            "used_at": datetime.now()
+        })
 
         if is_lifetime:
             msg_text = f"🎉 <b>Payment Verified!</b>\n\nSubscription: Lifetime Membership ♾️\n\nJoin Link: {link.invite_link}\n\n✅ This is a lifetime membership — no expiry!"
@@ -687,10 +772,67 @@ def verify_utr(msg):
             msg_text = f"🎉 <b>Payment Verified!</b>\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes."
 
         bot.send_message(user_id, msg_text, parse_mode="HTML")
-        bot.send_message(ADMIN_ID, f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UTR {utr} (₹{paid_amount}).")
-        del pending_payments[user_id]
+        bot.send_message(ADMIN_ID, f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount}).")
+        pending_payments.pop(user_id, None)
     except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Error during auto-approval: {e}")
+        bot.send_message(ADMIN_ID, f"❌ Error during UPIQRPay auto-approval: {e}")
+
+
+@app.route('/payment-return')
+def payment_return():
+    return "Payment completed. You can return to Telegram and check your payment status.", 200
+
+
+@app.route('/webhook/upiqrpay', methods=['POST'])
+def upiqrpay_webhook():
+    # UPIQRPay signs the exact raw request body with HMAC-SHA256.
+    raw_body = request.get_data()
+    signature = request.headers.get('X-UPIQRPAY-Signature', '')
+    if not UPIQRPAY_WEBHOOK_SECRET:
+        return "Webhook secret not configured", 500
+
+    expected = hmac.new(
+        UPIQRPAY_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return "Invalid signature", 401
+
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception:
+        return "Invalid JSON", 400
+
+    if data.get("event") != "payment.success":
+        return "OK", 200
+
+    payment_id = str(data.get("payment_id", ''))
+    if not payment_id:
+        return "Missing payment_id", 400
+
+    # Webhook is only used as a status signal here. The actual subscription
+    # crediting remains tied to a known Telegram pending payment.
+    for user_id, plan in list(pending_payments.items()):
+        if str(plan.get("payment_id")) == payment_id:
+            # Reuse the same verified status path by checking the API directly.
+            try:
+                resp = requests.get(
+                    f"https://upiqrpay.in/api/v1/order/status/{requests.utils.quote(payment_id, safe='')}",
+                    headers={"Authorization": f"Bearer {UPIQRPAY_API_KEY}"},
+                    timeout=15
+                )
+                status_data = resp.json()
+                payment = status_data.get("data", {})
+                if status_data.get("success") and str(payment.get("status", '')).lower() == 'success':
+                    # The user can press I Have Paid to complete the Telegram-side credit.
+                    try:
+                        bot.send_message(user_id, "✅ Payment received! Tap 'I Have Paid' on the payment message to verify and get your join link.")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            break
+
+    return "OK", 200
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('manage_'))
 def manage_ch(call):
