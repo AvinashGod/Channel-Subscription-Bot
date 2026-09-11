@@ -96,8 +96,26 @@ import html as _html
 def esc(s):
     return _html.escape(str(s))
 
+def sync_channel_name(ch_data):
+    """Refresh the stored channel title from Telegram so renamed channels never show a stale name."""
+    if not ch_data or not ch_data.get('channel_id'):
+        return ch_data
+    try:
+        chat = bot.get_chat(int(ch_data['channel_id']))
+        telegram_name = getattr(chat, 'title', None)
+        if telegram_name and telegram_name != ch_data.get('name'):
+            ch_data['name'] = telegram_name
+            channels_col.update_one(
+                {"channel_id": ch_data['channel_id']},
+                {"$set": {"name": telegram_name}}
+            )
+    except Exception:
+        pass  # Keep the last known name if Telegram cannot be queried.
+    return ch_data
+
 def disp_name(ch_data):
-    """Returns the admin-set display name if one is configured, otherwise the real Telegram channel title."""
+    """Returns the admin-set display name if configured, otherwise the current Telegram channel title."""
+    ch_data = sync_channel_name(ch_data)
     return ch_data.get('display_name') or ch_data['name']
 
 def plan_info(p_val):
@@ -298,6 +316,7 @@ def list_channels(message):
     cursor = channels_col.find({"admin_id": ADMIN_ID})
     count = 0
     for ch in cursor:
+        ch = sync_channel_name(ch)
         markup.add(InlineKeyboardButton(f"Channel: {ch['name']}", callback_data=f"manage_{ch['channel_id']}"))
         count += 1
     
@@ -395,19 +414,50 @@ def adm_active(call):
         bot.send_message(call.message.chat.id, "No active subscribers right now.")
         return
 
-    lines = [f"👥 *Active Subscribers* ({len(active)})\n"]
-    for u in active[:25]:
-        ch_data = channels_col.find_one({"channel_id": u['channel_id']})
-        ch_name = ch_data['name'] if ch_data else str(u['channel_id'])
-        if u.get("lifetime"):
-            lines.append(f"• User {u['user_id']} — {ch_name} — Lifetime ♾️")
-        else:
-            remaining_min = int((u['expiry'] - now) / 60)
-            lines.append(f"• User {u['user_id']} — {ch_name} — expires in {remaining_min} min")
-    if len(active) > 25:
-        lines.append(f"... and {len(active) - 25} more")
+    # Telegram messages are length-limited, so export the complete list as a TXT file.
+    # Every active subscriber is included; nothing is truncated at 25 members.
+    lines = [
+        "ACTIVE SUBSCRIBERS",
+        "=" * 80,
+        f"Total active subscribers: {len(active)}",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
 
-    bot.send_message(call.message.chat.id, "\n".join(lines), parse_mode="Markdown")
+    for index, u in enumerate(active, 1):
+        ch_data = channels_col.find_one({"channel_id": u['channel_id']})
+        ch_name = ch_data.get('name', str(u['channel_id'])) if ch_data else str(u['channel_id'])
+
+        lines.append(f"Member #{index}")
+        lines.append(f"User ID: {u.get('user_id', 'N/A')}")
+        lines.append(f"Channel: {ch_name}")
+        lines.append(f"Channel ID: {u.get('channel_id', 'N/A')}")
+
+        if u.get("lifetime"):
+            lines.append("Membership: Lifetime")
+            lines.append("Expiry: Never")
+        else:
+            expiry = u.get('expiry')
+            if expiry:
+                expiry_dt = datetime.fromtimestamp(expiry)
+                remaining_min = max(0, int((expiry - now) / 60))
+                lines.append("Membership: Time-limited")
+                lines.append(f"Expiry: {expiry_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                lines.append(f"Remaining: {remaining_min} minutes")
+            else:
+                lines.append("Membership: Unknown")
+                lines.append("Expiry: N/A")
+
+        lines.append("-" * 80)
+
+    document = BytesIO("\n".join(lines).encode("utf-8"))
+    document.name = f"active_subscribers_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    document.seek(0)
+    bot.send_document(
+        call.message.chat.id,
+        document,
+        caption=f"👥 Active Subscribers — {len(active)} members\n\nComplete list attached as TXT.",
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_channels")
 def adm_channels(call):
@@ -442,6 +492,7 @@ def adm_grant(call):
     cursor = channels_col.find({"admin_id": ADMIN_ID})
     count = 0
     for ch in cursor:
+        ch = sync_channel_name(ch)
         markup.add(InlineKeyboardButton(f"{ch['name']}", callback_data=f"grantch_{ch['channel_id']}"))
         count += 1
     if count == 0:
@@ -489,6 +540,7 @@ def adm_remove(call):
     cursor = channels_col.find({"admin_id": ADMIN_ID})
     count = 0
     for ch in cursor:
+        ch = sync_channel_name(ch)
         markup.add(InlineKeyboardButton(f"{ch['name']}", callback_data=f"removech_{ch['channel_id']}"))
         count += 1
     if count == 0:
@@ -732,11 +784,12 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
     try:
         paid_amount = payment.get("amount", plan["price"])
         try:
-            paid_amount_num = int(float(paid_amount))
+            paid_amount_num = round(float(paid_amount), 2)
         except (TypeError, ValueError):
             paid_amount_num = -1
 
-        if paid_amount_num != int(plan["price"]):
+        expected_price = float(plan["price"])
+        if abs(paid_amount_num - expected_price) > 0.01:
             bot.send_message(
                 user_id,
                 f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{plan['price']}. Contact admin."
@@ -764,7 +817,7 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
                 "order_id": payment.get("order_id", plan.get("order_id")),
                 "user_id": user_id,
                 "ch_id": ch_id,
-                "amount": paid_amount_num,
+                "amount": int(round(expected_price)),
                 "used_at": datetime.now()
             })
         except Exception:
@@ -945,7 +998,7 @@ def upiqrpay_webhook():
 @bot.callback_query_handler(func=lambda call: call.data.startswith('manage_'))
 def manage_ch(call):
     ch_id = int(call.data.split('_')[1])
-    ch_data = channels_col.find_one({"channel_id": ch_id})
+    ch_data = sync_channel_name(channels_col.find_one({"channel_id": ch_id}))
     bot_username = bot.get_me().username
     link = f"https://t.me/{bot_username}?start={ch_id}"
 
