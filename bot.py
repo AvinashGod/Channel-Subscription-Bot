@@ -192,6 +192,19 @@ def extendno(call):
     bot.answer_callback_query(call.id)
     show_channel_list(call.message.chat.id)
 
+def has_available_coupon():
+    """Return True only when at least one currently usable admin-created coupon exists."""
+    now = datetime.now()
+    for coupon in coupons_col.find({"active": {"$ne": False}}):
+        expires_at = coupon.get("expires_at")
+        if expires_at and expires_at <= now:
+            continue
+        max_uses = coupon.get("max_uses")
+        if max_uses is not None and int(coupon.get("used_count", 0)) >= int(max_uses):
+            continue
+        return True
+    return False
+
 def show_channel_list(chat_id):
     markup = InlineKeyboardMarkup()
     cursor = channels_col.find({})
@@ -199,11 +212,23 @@ def show_channel_list(chat_id):
     for ch in cursor:
         markup.add(InlineKeyboardButton(f"{disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
         count += 1
-    if coupon_sessions.get(chat_id):
-        code = coupon_sessions.get(chat_id)
-        markup.add(InlineKeyboardButton(f"🎟️ Coupon Applied: {code}", callback_data="remove_coupon"))
-    else:
+
+    coupon_code = coupon_sessions.get(chat_id)
+    if coupon_code:
+        coupon = coupons_col.find_one({"code": coupon_code})
+        if coupon and coupon.get("active", True) is not False:
+            expires_at = coupon.get("expires_at")
+            max_uses = coupon.get("max_uses")
+            if (not expires_at or expires_at > datetime.now()) and (max_uses is None or int(coupon.get("used_count", 0)) < int(max_uses)):
+                markup.add(InlineKeyboardButton(f"🎟️ Coupon Applied: {coupon_code}", callback_data="remove_coupon"))
+            else:
+                coupon_sessions.pop(chat_id, None)
+        else:
+            coupon_sessions.pop(chat_id, None)
+
+    if not coupon_sessions.get(chat_id) and has_available_coupon():
         markup.add(InlineKeyboardButton("🎟️ Apply Coupon", callback_data="apply_coupon"))
+
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtostart"))
 
     if count == 0:
