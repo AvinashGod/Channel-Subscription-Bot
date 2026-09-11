@@ -43,11 +43,13 @@ channels_col = db['channels']
 users_col = db['users']
 used_utrs_col = db['used_utrs']  # permanent record of spent UTRs, never touched by kick_expired_users
 settings_col = db['settings']  # small key/value store for things like the welcome image
+coupons_col = db['coupons']
 
 # In-memory tracker: user_id -> {"ch_id":.., "mins":.., "price":..}
 pending_payments = {}
 payment_processing = set()
 payment_lock = Lock()
+coupon_sessions = {}  # user_id -> coupon code applied to the current purchase flow
 
 # Tracks the last "navigation" message per chat: {"message_id": ..., "has_photo": bool}
 # so a button tap can edit it in place, while a typed command still deletes and sends fresh.
@@ -197,6 +199,11 @@ def show_channel_list(chat_id):
     for ch in cursor:
         markup.add(InlineKeyboardButton(f"{disp_name(ch)}", callback_data=f"viewch_{ch['channel_id']}"))
         count += 1
+    if coupon_sessions.get(chat_id):
+        code = coupon_sessions.get(chat_id)
+        markup.add(InlineKeyboardButton(f"🎟️ Coupon Applied: {code}", callback_data="remove_coupon"))
+    else:
+        markup.add(InlineKeyboardButton("🎟️ Apply Coupon", callback_data="apply_coupon"))
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtostart"))
 
     if count == 0:
@@ -294,7 +301,7 @@ def help_handler(message):
     if message.from_user.id == ADMIN_ID:
         text = ("🤖 <b>Admin Commands:</b>\n\n"
                 "/start – Start the bot (same view as users)\n"
-                "/admin – Open Admin Panel (add channels, edit prices, stats, grant/remove access, images, and more)\n"
+                "/admin – Open Admin Panel (payments, revenue, users, coupons, channels, and more)\n"
                 "/myplan – Check your plans\n"
                 "/help – Show this help")
     else:
@@ -303,6 +310,48 @@ def help_handler(message):
                 "/myplan – Check your plans\n"
                 "/help – Show this help")
     send_page(message.chat.id, text, parse_mode="HTML", force_new=True)
+
+@bot.callback_query_handler(func=lambda call: call.data == "apply_coupon")
+def apply_coupon(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id,
+        "🎟️ Send your coupon code.\n\nSend /cancel to go back.")
+    bot.register_next_step_handler(msg, process_user_coupon)
+
+
+def process_user_coupon(message):
+    if message.text and message.text.strip().lower() == "/cancel":
+        show_channel_list(message.chat.id)
+        return
+    code = (message.text or "").strip().upper()
+    coupon = coupons_col.find_one({"code": code})
+    now = datetime.now()
+    if not coupon:
+        bot.send_message(message.chat.id, "❌ Invalid coupon code.")
+        return
+    if coupon.get("active", True) is False:
+        bot.send_message(message.chat.id, "❌ This coupon is no longer active.")
+        return
+    expires_at = coupon.get("expires_at")
+    if expires_at and expires_at <= now:
+        bot.send_message(message.chat.id, "❌ This coupon has expired.")
+        return
+    max_uses = coupon.get("max_uses")
+    used_count = int(coupon.get("used_count", 0))
+    if max_uses is not None and used_count >= int(max_uses):
+        bot.send_message(message.chat.id, "❌ This coupon has reached its usage limit.")
+        return
+    coupon_sessions[message.from_user.id] = code
+    bot.send_message(message.chat.id, f"✅ Coupon <b>{esc(code)}</b> applied!\n\nDiscount: <b>{coupon.get('percent', 0)}%</b>", parse_mode="HTML")
+    show_channel_list(message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "remove_coupon")
+def remove_coupon(call):
+    bot.answer_callback_query(call.id, "Coupon removed")
+    coupon_sessions.pop(call.from_user.id, None)
+    show_channel_list(call.message.chat.id)
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('viewch_'))
 def view_channel(call):
@@ -375,7 +424,10 @@ def admin_panel(message):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("➕ Add New Channel", callback_data="add_new"))
     markup.add(InlineKeyboardButton("📊 Stats", callback_data="adm_stats"))
+    markup.add(InlineKeyboardButton("💳 Payment History", callback_data="adm_history"))
     markup.add(InlineKeyboardButton("👥 Active Subscribers", callback_data="adm_active"))
+    markup.add(InlineKeyboardButton("🔎 Search User", callback_data="adm_usersearch"))
+    markup.add(InlineKeyboardButton("🎟️ Manage Coupons", callback_data="adm_coupons"))
     markup.add(InlineKeyboardButton("🎁 Manually Grant Access", callback_data="adm_grant"))
     markup.add(InlineKeyboardButton("🚫 Remove Membership", callback_data="adm_remove"))
     markup.add(InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast"))
@@ -387,22 +439,33 @@ def admin_panel(message):
 @bot.callback_query_handler(func=lambda call: call.data == "adm_stats")
 def adm_stats(call):
     bot.answer_callback_query(call.id)
+    now = datetime.now()
     total_channels = channels_col.count_documents({"admin_id": ADMIN_ID})
-    active_subs = users_col.count_documents({"$or": [{"expiry": {"$gt": datetime.now().timestamp()}}, {"lifetime": True}]})
-    total_approvals = used_utrs_col.count_documents({})
-    total_revenue = sum(a.get("amount", 0) for a in used_utrs_col.find({}))
+    active_subs = users_col.count_documents({"$or": [{"expiry": {"$gt": now.timestamp()}}, {"lifetime": True}]})
+    total_payments = used_utrs_col.count_documents({})
+    total_revenue = sum(float(a.get("amount", 0)) for a in used_utrs_col.find({}))
 
-    since = datetime.now() - timedelta(hours=24)
-    today_approvals = list(used_utrs_col.find({"used_at": {"$gte": since}}))
-    today_revenue = sum(a.get("amount", 0) for a in today_approvals)
+    since_24 = now - timedelta(hours=24)
+    since_7 = now - timedelta(days=7)
+    since_30 = now - timedelta(days=30)
+    p24 = list(used_utrs_col.find({"used_at": {"$gte": since_24}}))
+    p7 = list(used_utrs_col.find({"used_at": {"$gte": since_7}}))
+    p30 = list(used_utrs_col.find({"used_at": {"$gte": since_30}}))
 
-    bot.send_message(call.message.chat.id,
-        f"📊 *Bot Stats*\n\n"
-        f"Channels: {total_channels}\n"
-        f"Active subscribers: {active_subs}\n\n"
-        f"*All-time*\nApprovals: {total_approvals}\nRevenue: ₹{total_revenue}\n\n"
-        f"*Last 24 hours*\nApprovals: {len(today_approvals)}\nRevenue: ₹{today_revenue}",
-        parse_mode="Markdown")
+    revenue = lambda rows: sum(float(x.get("amount", 0)) for x in rows)
+    text = (
+        "📊 <b>Bot Revenue Dashboard</b>\n\n"
+        f"Channels: <b>{total_channels}</b>\n"
+        f"Active subscribers: <b>{active_subs}</b>\n\n"
+        f"💰 <b>All-time</b>\nPayments: {total_payments}\nRevenue: ₹{total_revenue:.2f}\n\n"
+        f"📅 <b>Last 24 Hours</b>\nPayments: {len(p24)}\nRevenue: ₹{revenue(p24):.2f}\n\n"
+        f"📈 <b>Last 7 Days</b>\nPayments: {len(p7)}\nRevenue: ₹{revenue(p7):.2f}\n\n"
+        f"🗓 <b>Last 30 Days</b>\nPayments: {len(p30)}\nRevenue: ₹{revenue(p30):.2f}"
+    )
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💳 Full Payment History", callback_data="adm_history"))
+    bot.send_message(call.message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_active")
 def adm_active(call):
@@ -425,7 +488,7 @@ def adm_active(call):
     ]
 
     for index, u in enumerate(active, 1):
-        ch_data = channels_col.find_one({"channel_id": u['channel_id']})
+        ch_data = sync_channel_name(channels_col.find_one({"channel_id": u['channel_id']}))
         ch_name = ch_data.get('name', str(u['channel_id'])) if ch_data else str(u['channel_id'])
 
         lines.append(f"Member #{index}")
@@ -458,6 +521,159 @@ def adm_active(call):
         document,
         caption=f"👥 Active Subscribers — {len(active)} members\n\nComplete list attached as TXT.",
     )
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_history")
+def adm_history(call):
+    bot.answer_callback_query(call.id)
+    rows = list(used_utrs_col.find({}).sort("used_at", -1))
+    if not rows:
+        bot.send_message(call.message.chat.id, "💳 No payment history yet.")
+        return
+    lines = ["PAYMENT HISTORY", "=" * 90, f"Total payments: {len(rows)}", ""]
+    for i, r in enumerate(rows, 1):
+        used_at = r.get("used_at")
+        when = used_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(used_at, "strftime") else str(used_at)
+        lines += [
+            f"Payment #{i}",
+            f"User ID: {r.get('user_id', 'N/A')}",
+            f"Amount: ₹{r.get('amount', 'N/A')}",
+            f"Channel ID: {r.get('ch_id', r.get('channel_id', 'N/A'))}",
+            f"UTR: {r.get('utr', 'N/A')}",
+            f"Payment ID: {r.get('payment_id', 'N/A')}",
+            f"Order ID: {r.get('order_id', 'N/A')}",
+            f"Time: {when}",
+            "-" * 90
+        ]
+    doc = BytesIO("\n".join(lines).encode("utf-8"))
+    doc.name = f"payment_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    doc.seek(0)
+    bot.send_document(call.message.chat.id, doc, caption=f"💳 Complete payment history — {len(rows)} payments")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_usersearch")
+def adm_usersearch(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id, "🔎 Send the Telegram user ID to search.")
+    bot.register_next_step_handler(msg, process_usersearch)
+
+
+def process_usersearch(message):
+    try:
+        uid = int(message.text.strip())
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid Telegram user ID.")
+        return
+    now_ts = datetime.now().timestamp()
+    subs = list(users_col.find({"user_id": uid}))
+    payments = list(used_utrs_col.find({"user_id": uid}).sort("used_at", -1))
+    lines = [f"🔎 <b>User {uid}</b>", ""]
+    if subs:
+        lines.append("<b>Memberships</b>")
+        for s in subs:
+            ch = sync_channel_name(channels_col.find_one({"channel_id": s.get("channel_id")}))
+            name = esc(disp_name(ch)) if ch else str(s.get("channel_id"))
+            if s.get("lifetime"):
+                status = "Lifetime ♾️"
+            else:
+                exp = s.get("expiry", 0)
+                status = f"Expires: {datetime.fromtimestamp(exp).strftime('%Y-%m-%d %H:%M')}" if exp else "No expiry"
+                if exp <= now_ts:
+                    status += " (expired)"
+            lines.append(f"• {name} — {status}")
+    else:
+        lines.append("No membership records found.")
+    lines.append(f"\n<b>Payments</b>: {len(payments)}")
+    if payments:
+        lines.append(f"Total paid: ₹{sum(float(x.get('amount', 0)) for x in payments):.2f}")
+    markup = InlineKeyboardMarkup()
+    for s in subs[:10]:
+        ch_id = s.get("channel_id")
+        markup.add(InlineKeyboardButton(f"➕ Extend 1 Day — {ch_id}", callback_data=f"usr_ext_{uid}_{ch_id}"))
+        markup.add(InlineKeyboardButton(f"🚫 Remove — {ch_id}", callback_data=f"usr_rem_{uid}_{ch_id}"))
+    bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="HTML", reply_markup=markup if subs else None)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("usr_ext_"))
+def user_extend_one_day(call):
+    bot.answer_callback_query(call.id)
+    _, _, uid, ch_id = call.data.split("_")
+    uid, ch_id = int(uid), int(ch_id)
+    try:
+        link, lifetime = create_access(uid, ch_id, "1440")
+        bot.send_message(ADMIN_ID, f"✅ Extended user {uid} by 1 day for channel {ch_id}.")
+        bot.send_message(uid, f"➕ Your membership has been extended by 1 day.\n\nNew join link: {link.invite_link}")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Could not extend membership: {e}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("usr_rem_"))
+def user_remove_membership(call):
+    bot.answer_callback_query(call.id)
+    _, _, uid, ch_id = call.data.split("_")
+    uid, ch_id = int(uid), int(ch_id)
+    try:
+        bot.ban_chat_member(ch_id, uid)
+        bot.unban_chat_member(ch_id, uid)
+    except Exception:
+        pass
+    users_col.delete_one({"user_id": uid, "channel_id": ch_id})
+    bot.send_message(ADMIN_ID, f"🚫 Removed user {uid} from channel {ch_id}.")
+    try:
+        bot.send_message(uid, "⚠️ Your membership has been removed by the admin.")
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_coupons")
+def adm_coupons(call):
+    bot.answer_callback_query(call.id)
+    coupons = list(coupons_col.find({}).sort("code", 1))
+    lines = ["🎟️ <b>Coupon Manager</b>", ""]
+    if not coupons:
+        lines.append("No coupons created yet.")
+    else:
+        for c in coupons:
+            limit = "∞" if c.get("max_uses") is None else str(c.get("max_uses"))
+            lines.append(f"• <b>{esc(c.get('code'))}</b> — {c.get('percent', 0)}% off — {c.get('used_count', 0)}/{limit} used")
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("➕ Create Coupon", callback_data="coupon_create"))
+    for c in coupons[:15]:
+        markup.add(InlineKeyboardButton(f"🗑 Delete {c.get('code')}", callback_data=f"coupon_del_{c.get('code')}"))
+    bot.send_message(call.message.chat.id, "\n".join(lines), parse_mode="HTML", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "coupon_create")
+def coupon_create(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id, "🎟️ Send coupon as: CODE PERCENT [MAX_USES]\n\nExample: SAVE20 20 100\nUse `SAVE20 20` for unlimited uses.")
+    bot.register_next_step_handler(msg, process_coupon_create)
+
+
+def process_coupon_create(message):
+    try:
+        parts = message.text.strip().split()
+        code = parts[0].upper()
+        percent = int(parts[1])
+        max_uses = int(parts[2]) if len(parts) > 2 else None
+        if not code or len(code) > 30 or not (1 <= percent <= 99) or (max_uses is not None and max_uses < 1):
+            raise ValueError
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid format. Use: CODE PERCENT [MAX_USES].")
+        return
+    if coupons_col.find_one({"code": code}):
+        bot.send_message(ADMIN_ID, "❌ That coupon already exists.")
+        return
+    coupons_col.insert_one({"code": code, "percent": percent, "max_uses": max_uses, "used_count": 0, "active": True, "created_at": datetime.now()})
+    bot.send_message(ADMIN_ID, f"✅ Coupon <b>{esc(code)}</b> created — {percent}% off.", parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("coupon_del_"))
+def coupon_delete(call):
+    bot.answer_callback_query(call.id)
+    code = call.data[len("coupon_del_"):].upper()
+    result = coupons_col.delete_one({"code": code})
+    bot.send_message(ADMIN_ID, f"{'🗑 Deleted' if result.deleted_count else '❌ Coupon not found'}: {esc(code)}", parse_mode="HTML")
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_channels")
 def adm_channels(call):
@@ -630,7 +846,7 @@ def create_access(user_id, ch_id, mins):
         link = bot.create_chat_invite_link(ch_id, member_limit=1)
         users_col.update_one(
             {"user_id": user_id, "channel_id": ch_id},
-            {"$set": {"lifetime": True}, "$unset": {"expiry": ""}},
+            {"$set": {"lifetime": True, "reminder_24_sent": False, "reminder_1_sent": False}, "$unset": {"expiry": ""}},
             upsert=True
         )
         return link, True
@@ -650,7 +866,7 @@ def create_access(user_id, ch_id, mins):
     link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
     users_col.update_one(
         {"user_id": user_id, "channel_id": ch_id},
-        {"$set": {"expiry": expiry_datetime.timestamp()}, "$unset": {"lifetime": ""}},
+        {"$set": {"expiry": expiry_datetime.timestamp(), "reminder_24_sent": False, "reminder_1_sent": False}, "$unset": {"lifetime": ""}},
         upsert=True
     )
     return link, False
@@ -668,11 +884,24 @@ def user_pays(call):
         return
 
     price, custom_label = plan_info(ch_data['plans'][mins])
-    price = int(price)
+    price = float(price)
+    coupon_code = coupon_sessions.get(call.from_user.id)
+    coupon = coupons_col.find_one({"code": coupon_code}) if coupon_code else None
+    discount_percent = 0
+    if coupon:
+        expires_at = coupon.get("expires_at")
+        max_uses = coupon.get("max_uses")
+        if coupon.get("active", True) is False or (expires_at and expires_at <= datetime.now()) or (max_uses is not None and int(coupon.get("used_count", 0)) >= int(max_uses)):
+            coupon = None
+            coupon_code = None
+            coupon_sessions.pop(call.from_user.id, None)
+        else:
+            discount_percent = int(coupon.get("percent", 0))
+    pay_amount = round(price * (100 - discount_percent) / 100, 2)
     order_id = f"TG_{call.from_user.id}_{uuid.uuid4().hex[:12]}"
 
     payload = {
-        "amount": price,
+        "amount": pay_amount,
         "order_id": order_id,
         "customer_name": call.from_user.first_name or "Telegram User",
         "customer_phone": "9999999999",
@@ -714,6 +943,10 @@ def user_pays(call):
         plan_label = custom_label
     else:
         plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
+    price_display = f"₹{price:.2f}" if price % 1 else f"₹{int(price)}"
+    amount_line = f"Price: {price_display}"
+    if discount_percent:
+        amount_line += f"\n🎟️ Coupon {coupon_code}: -{discount_percent}%\n💰 Pay: ₹{pay_amount:.2f}"
 
     # Use the actual payment QR returned by UPIQRPay.
     # Do NOT generate a QR from pay_url: pay_url opens a web payment page and
@@ -733,13 +966,16 @@ def user_pays(call):
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancelpay_{ch_id}"))
 
     send_page(call.message.chat.id,
-              f"Plan: {plan_label}\nPrice: ₹{price}\n\nScan this QR to pay.\n\n✅ Payment is checked automatically every 5 seconds. You don't need to tap anything after paying.",
+              f"Plan: {plan_label}\n{amount_line}\n\nScan this QR to pay.\n\n✅ Payment is checked automatically every 5 seconds. You don't need to tap anything after paying.",
               photo=qr_photo, reply_markup=markup, parse_mode="Markdown")
 
     pending_payments[call.from_user.id] = {
         "ch_id": ch_id,
         "mins": mins,
         "price": price,
+        "pay_amount": pay_amount,
+        "coupon_code": coupon_code,
+        "discount_percent": discount_percent,
         "payment_id": payment_id,
         "order_id": payment.get("order_id", order_id),
     }
@@ -788,15 +1024,15 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
         except (TypeError, ValueError):
             paid_amount_num = -1
 
-        expected_price = float(plan["price"])
+        expected_price = float(plan.get("pay_amount", plan["price"]))
         if abs(paid_amount_num - expected_price) > 0.01:
             bot.send_message(
                 user_id,
-                f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{plan['price']}. Contact admin."
+                f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{expected_price:.2f}. Contact admin."
             )
             bot.send_message(
                 ADMIN_ID,
-                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{plan['price']}, payment {payment_id}"
+                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{expected_price:.2f}, payment {payment_id}"
             )
             return False
 
@@ -817,7 +1053,10 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
                 "order_id": payment.get("order_id", plan.get("order_id")),
                 "user_id": user_id,
                 "ch_id": ch_id,
-                "amount": int(round(expected_price)),
+                "amount": round(expected_price, 2),
+                "original_amount": round(float(plan.get("price", expected_price)), 2),
+                "coupon_code": plan.get("coupon_code"),
+                "discount_percent": int(plan.get("discount_percent", 0)),
                 "used_at": datetime.now()
             })
         except Exception:
@@ -826,6 +1065,11 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
                 pending_payments.pop(user_id, None)
                 return False
             raise
+
+        coupon_code = plan.get("coupon_code")
+        if coupon_code:
+            coupons_col.update_one({"code": coupon_code}, {"$inc": {"used_count": 1}})
+        coupon_sessions.pop(user_id, None)
 
         if is_lifetime:
             msg_text = (
@@ -1145,6 +1389,28 @@ def do_delete_channel(call):
                           call.message.chat.id, call.message.message_id, parse_mode="Markdown")
 
 # Automate Kicking
+def send_expiry_reminders():
+    """Send 24-hour and 1-hour reminders once per membership period."""
+    now_ts = datetime.now().timestamp()
+    for user in list(users_col.find({"lifetime": {"$ne": True}, "expiry": {"$gt": now_ts}})):
+        expiry = float(user.get("expiry", 0))
+        remaining = expiry - now_ts
+        try:
+            ch_id = user.get("channel_id")
+            bot_username = bot.get_me().username
+            renew_url = f"https://t.me/{bot_username}?start={ch_id}"
+            renew_markup = InlineKeyboardMarkup()
+            renew_markup.add(InlineKeyboardButton("🔄 Renew Membership", url=renew_url))
+            if remaining <= 3600 and not user.get("reminder_1_sent"):
+                bot.send_message(user["user_id"], "🚨 Your subscription expires in less than 1 hour! Renew now to avoid losing access.", reply_markup=renew_markup)
+                users_col.update_one({"_id": user["_id"]}, {"$set": {"reminder_1_sent": True}})
+            elif remaining <= 86400 and not user.get("reminder_24_sent"):
+                bot.send_message(user["user_id"], "⏰ Your subscription expires in less than 24 hours. Renew now to keep your access active.", reply_markup=renew_markup)
+                users_col.update_one({"_id": user["_id"]}, {"$set": {"reminder_24_sent": True}})
+        except Exception:
+            pass
+
+
 def kick_expired_users():
     now = datetime.now().timestamp()
     expired_users = list(users_col.find({"expiry": {"$lte": now}}))
@@ -1190,6 +1456,7 @@ if __name__ == '__main__':
     keep_alive()
     scheduler = BackgroundScheduler()
     scheduler.add_job(kick_expired_users, 'interval', minutes=1)
+    scheduler.add_job(send_expiry_reminders, 'interval', minutes=1)
     scheduler.add_job(auto_check_pending_payments, 'interval', seconds=5, max_instances=1, coalesce=True)
     scheduler.add_job(daily_summary, 'cron', hour=23, minute=59)
     scheduler.start()
