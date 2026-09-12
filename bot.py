@@ -205,8 +205,15 @@ def has_available_coupon():
         return True
     return False
 
-def show_channel_list(chat_id):
+def show_channel_list(chat_id, first_name=None):
     markup = InlineKeyboardMarkup()
+    if not first_name:
+        try:
+            chat_info = bot.get_chat(chat_id)
+            first_name = getattr(chat_info, "first_name", None)
+        except Exception:
+            first_name = None
+    safe_name = esc(first_name or "there")
     cursor = channels_col.find({})
     count = 0
     for ch in cursor:
@@ -240,6 +247,8 @@ def show_channel_list(chat_id):
         channel_text = channel_message.get("value") if channel_message and channel_message.get("value") else (
             "📢 <b>SELECT A CHANNEL</b>\n\nChoose one of our premium channels from below to view plans and pricing:"
         )
+        # Support the same {first_name} placeholder as the editable /start message.
+        channel_text = channel_text.replace("{first_name}", safe_name)
         send_page(chat_id, channel_text,
                    photo=list_image, reply_markup=markup, parse_mode="HTML")
 
