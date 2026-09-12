@@ -263,6 +263,9 @@ def get_welcome_image():
 def show_welcome(chat_id, first_name, force_new=False):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("💎 BUY MEMBERSHIP", callback_data="buy_membership"))
+    help_btn = InlineKeyboardButton("❓ HELP", callback_data="start_help")
+    support_btn = InlineKeyboardButton("🆘 SUPPORT", url="https://t.me/OggySubscriptionRobot")
+    markup.row(help_btn, support_btn)
     safe_name = esc(first_name or "there")
     default_template = ("<blockquote>👋 <b>Welcome, {first_name}!</b>\n\n"
                         "I am your Premium Subscription Bot. 🤖\n"
@@ -291,6 +294,12 @@ def start_handler(message):
         except: pass
 
     show_welcome(message.chat.id, message.from_user.first_name, force_new=True)
+
+@bot.callback_query_handler(func=lambda call: call.data == "start_help")
+def start_help(call):
+    bot.answer_callback_query(call.id)
+    help_handler(call.message)
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "buy_membership")
 def buy_membership(call):
