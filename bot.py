@@ -236,8 +236,12 @@ def show_channel_list(chat_id):
     else:
         list_image_setting = settings_col.find_one({"key": "channel_list_image"})
         list_image = list_image_setting["value"] if list_image_setting and list_image_setting.get("value") else None
-        send_page(chat_id, "📢 *SELECT A CHANNEL*\n\nChoose one of our premium channels from below to view plans and pricing:",
-                   photo=list_image, reply_markup=markup, parse_mode="Markdown")
+        channel_message = settings_col.find_one({"key": "channel_list_message"})
+        channel_text = channel_message.get("value") if channel_message and channel_message.get("value") else (
+            "📢 <b>SELECT A CHANNEL</b>\n\nChoose one of our premium channels from below to view plans and pricing:"
+        )
+        send_page(chat_id, channel_text,
+                   photo=list_image, reply_markup=markup, parse_mode="HTML")
 
 def get_welcome_image():
     """Returns a Telegram file_id or URL to use for the /start image, or None if none is set.
@@ -250,12 +254,19 @@ def get_welcome_image():
 def show_welcome(chat_id, first_name, force_new=False):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("💎 BUY MEMBERSHIP", callback_data="buy_membership"))
-    caption = (f"👋 Welcome, {first_name}!\n\n"
-               f"I am your Premium Subscription Bot. 🤖\n"
-               f"I can help you get instant access to our exclusive premium channels.\n\n"
-               f"👇 Click on Buy Membership button below to browse our premium channel plans!")
+    safe_name = esc(first_name or "there")
+    default_template = ("<blockquote>👋 <b>Welcome, {first_name}!</b>\n\n"
+                        "I am your Premium Subscription Bot. 🤖\n"
+                        "I can help you get instant access to our exclusive premium channels ⚡</blockquote>\n\n"
+                        "👇 <b>Click on Buy Membership button to browse our premium channel plans!</b>")
+    setting = settings_col.find_one({"key": "start_message"})
+    template = setting.get("value") if setting and setting.get("value") else default_template
+    try:
+        caption = template.replace("{first_name}", safe_name)
+    except Exception:
+        caption = default_template.replace("{first_name}", safe_name)
     welcome_image = get_welcome_image()
-    send_page(chat_id, caption, photo=welcome_image, reply_markup=markup, force_new=force_new)
+    send_page(chat_id, caption, photo=welcome_image, reply_markup=markup, parse_mode="HTML", force_new=force_new)
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
@@ -457,6 +468,8 @@ def admin_panel(message):
     markup.add(InlineKeyboardButton("🚫 Remove Membership", callback_data="adm_remove"))
     markup.add(InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast"))
     markup.add(InlineKeyboardButton("📋 Manage Channels", callback_data="adm_channels"))
+    markup.add(InlineKeyboardButton("✏️ Edit Start Message", callback_data="adm_editstart"))
+    markup.add(InlineKeyboardButton("✏️ Edit Channel List Message", callback_data="adm_editchmsg"))
     markup.add(InlineKeyboardButton("🖼 Set Welcome Image", callback_data="adm_setimg"))
     markup.add(InlineKeyboardButton("🖼 Set Channel List Image", callback_data="adm_setlistimg"))
     bot.send_message(message.chat.id, "🛠 *Admin Panel*\n\nChoose an option:", reply_markup=markup, parse_mode="Markdown")
@@ -812,6 +825,74 @@ def process_remove(message, ch_id):
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Error removing member: {e}\n\n(Note removed from database anyway if they were tracked.)")
         users_col.delete_one({"user_id": target_id, "channel_id": ch_id})
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_editstart")
+def adm_editstart(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(
+        call.message.chat.id,
+        "✏️ <b>Edit Start Message</b>\n\n"
+        "Send the new /start message text.\n\n"
+        "Use <code>{first_name}</code> where you want the user's name.\n"
+        "You can use HTML formatting such as <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code> and <code>&lt;blockquote&gt;</code>.\n\n"
+        "Send /cancel to keep the current message, or /reset to restore the default message.",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, process_editstart)
+
+def process_editstart(message):
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        bot.send_message(ADMIN_ID, "Cancelled — start message unchanged.")
+        return
+    if text == "/reset":
+        settings_col.delete_one({"key": "start_message"})
+        bot.send_message(ADMIN_ID, "✅ Start message reset to the default message.")
+        return
+    if not text:
+        bot.send_message(ADMIN_ID, "❌ Please send some text, or /cancel.")
+        return
+    # Validate the HTML before saving so a malformed tag does not break /start.
+    try:
+        bot.send_message(ADMIN_ID, text.replace("{first_name}", esc("Preview")), parse_mode="HTML")
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid HTML formatting. Please check your tags and try again.")
+        return
+    settings_col.update_one({"key": "start_message"}, {"$set": {"value": text}}, upsert=True)
+    bot.send_message(ADMIN_ID, "✅ Start message updated! Send /start to preview it.")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_editchmsg")
+def adm_editchmsg(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(
+        call.message.chat.id,
+        "✏️ <b>Edit Select Channel Message</b>\n\n"
+        "Send the new message shown above the channel buttons.\n\n"
+        "You can use HTML formatting such as <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code> and <code>&lt;blockquote&gt;</code>.\n\n"
+        "Send /cancel to keep the current message, or /reset to restore the default message.",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, process_editchmsg)
+
+def process_editchmsg(message):
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        bot.send_message(ADMIN_ID, "Cancelled — channel list message unchanged.")
+        return
+    if text == "/reset":
+        settings_col.delete_one({"key": "channel_list_message"})
+        bot.send_message(ADMIN_ID, "✅ Select Channel message reset to the default message.")
+        return
+    if not text:
+        bot.send_message(ADMIN_ID, "❌ Please send some text, or /cancel.")
+        return
+    try:
+        bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid HTML formatting. Please check your tags and try again.")
+        return
+    settings_col.update_one({"key": "channel_list_message"}, {"$set": {"value": text}}, upsert=True)
+    bot.send_message(ADMIN_ID, "✅ Select Channel message updated! Open Buy Membership to preview it.")
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_setimg")
 def adm_setimg(call):
