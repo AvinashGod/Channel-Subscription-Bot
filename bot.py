@@ -263,9 +263,6 @@ def get_welcome_image():
 def show_welcome(chat_id, first_name, force_new=False):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("💎 BUY MEMBERSHIP", callback_data="buy_membership"))
-    help_btn = InlineKeyboardButton("❓ HELP", callback_data="start_help")
-    support_btn = InlineKeyboardButton("🆘 SUPPORT", url="https://t.me/OggySubscriptionRobot")
-    markup.row(help_btn, support_btn)
     safe_name = esc(first_name or "there")
     default_template = ("<blockquote>👋 <b>Welcome, {first_name}!</b>\n\n"
                         "I am your Premium Subscription Bot. 🤖\n"
@@ -294,12 +291,6 @@ def start_handler(message):
         except: pass
 
     show_welcome(message.chat.id, message.from_user.first_name, force_new=True)
-
-@bot.callback_query_handler(func=lambda call: call.data == "start_help")
-def start_help(call):
-    bot.answer_callback_query(call.id)
-    help_handler(call.message)
-
 
 @bot.callback_query_handler(func=lambda call: call.data == "buy_membership")
 def buy_membership(call):
@@ -657,7 +648,7 @@ def user_extend_one_day(call):
     try:
         link, lifetime = create_access(uid, ch_id, "1440")
         bot.send_message(ADMIN_ID, f"✅ Extended user {uid} by 1 day for channel {ch_id}.")
-        bot.send_message(uid, f"➕ Your membership has been extended by 1 day.\n\nNew join link: {link.invite_link}")
+        bot.send_message(uid, f"➕ Your membership has been extended by 1 day.\n\nJoin Request Link: {link.invite_link}\n\n📩 Send a join request there. It will be approved automatically while your subscription is active.")
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Could not extend membership: {e}")
 
@@ -958,16 +949,35 @@ def process_setlistimg(message):
     settings_col.update_one({"key": "channel_list_image"}, {"$set": {"value": file_id}}, upsert=True)
     bot.send_message(ADMIN_ID, "✅ Channel list image updated!")
 
+def get_subscription_request_link(ch_id):
+    """Return one permanent join-request invite link for this channel.
+    The same link is reused for every subscriber; access is decided by the
+    chat-join-request handler, not by the link itself."""
+    ch = channels_col.find_one({"channel_id": ch_id})
+    if ch and ch.get("request_link"):
+        class Link:
+            pass
+        link = Link()
+        link.invite_link = ch["request_link"]
+        return link
+
+    link = bot.create_chat_invite_link(ch_id, creates_join_request=True, name="Subscription Requests")
+    channels_col.update_one(
+        {"channel_id": ch_id},
+        {"$set": {"request_link": link.invite_link}},
+        upsert=True
+    )
+    return link
+
+
 def create_access(user_id, ch_id, mins):
-    """Creates the invite link and updates the user's record. mins may be the string 'lifetime' or a number-as-string.
-    If the user already has time remaining on this channel, the new duration is added on top instead of resetting.
-    Returns (invite_link_obj, is_lifetime)."""
+    """Grant/extend subscription and return the channel's shared request link."""
     is_lifetime = str(mins).strip().lower() == "lifetime"
     existing = users_col.find_one({"user_id": user_id, "channel_id": ch_id})
     now_ts = datetime.now().timestamp()
+    link = get_subscription_request_link(ch_id)
 
     if is_lifetime:
-        link = bot.create_chat_invite_link(ch_id, member_limit=1)
         users_col.update_one(
             {"user_id": user_id, "channel_id": ch_id},
             {"$set": {"lifetime": True, "reminder_24_sent": False, "reminder_1_sent": False}, "$unset": {"expiry": ""}},
@@ -976,24 +986,40 @@ def create_access(user_id, ch_id, mins):
         return link, True
 
     if existing and existing.get("lifetime"):
-        # Already a lifetime member — don't downgrade them, just issue a fresh invite link.
-        link = bot.create_chat_invite_link(ch_id, member_limit=1)
         return link, True
 
     mins_int = int(mins)
     base_ts = now_ts
     if existing and existing.get("expiry", 0) > now_ts:
-        base_ts = existing["expiry"]  # extend from their current remaining time, not from now
+        base_ts = existing["expiry"]
 
     expiry_datetime = datetime.fromtimestamp(base_ts) + timedelta(minutes=mins_int)
-    expiry_ts = int(expiry_datetime.timestamp())
-    link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
     users_col.update_one(
         {"user_id": user_id, "channel_id": ch_id},
         {"$set": {"expiry": expiry_datetime.timestamp(), "reminder_24_sent": False, "reminder_1_sent": False}, "$unset": {"lifetime": ""}},
         upsert=True
     )
     return link, False
+
+
+@bot.chat_join_request_handler()
+def handle_subscription_join_request(request):
+    """Approve only users with an active/lifetime subscription for that channel."""
+    user_id = request.from_user.id
+    ch_id = request.chat.id
+    now_ts = datetime.now().timestamp()
+    subscription = users_col.find_one({"user_id": user_id, "channel_id": ch_id})
+
+    active = bool(subscription and (subscription.get("lifetime") or float(subscription.get("expiry", 0)) > now_ts))
+    try:
+        if active:
+            bot.approve_chat_join_request(ch_id, user_id)
+            bot.send_message(user_id, "✅ Your join request has been approved! Welcome to the premium channel.")
+        else:
+            bot.decline_chat_join_request(ch_id, user_id)
+            bot.send_message(user_id, "❌ Your join request was declined because you do not have an active subscription for this channel.")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Join-request handling failed for user {user_id}, channel {ch_id}: {e}")
 
 # --- USER: PAYMENT FLOW ---
 
@@ -1199,15 +1225,17 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
             msg_text = (
                 "🎉 <b>Payment Verified!</b>\n\n"
                 "Subscription: Lifetime Membership ♾️\n\n"
-                f"Join Link: {link.invite_link}\n\n"
+                f"Join Request Link: {link.invite_link}\n\n"
+                "📩 Send a join request using this link. Your request will be approved automatically while your subscription is active.\n"
                 "✅ This is a lifetime membership — no expiry!"
             )
         else:
             msg_text = (
                 "🎉 <b>Payment Verified!</b>\n\n"
                 f"Subscription: {mins} Minutes\n\n"
-                f"Join Link: {link.invite_link}\n\n"
-                f"⚠️ Note: This link and your access will expire in {mins} minutes."
+                f"Join Request Link: {link.invite_link}\n\n"
+                "📩 Send a join request using this link. Your request will be approved automatically while your subscription is active.\n"
+                f"⚠️ Your subscription expires in {mins} minutes."
             )
 
         bot.send_message(user_id, msg_text, parse_mode="HTML")
