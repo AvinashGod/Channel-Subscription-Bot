@@ -1248,7 +1248,14 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
                 f"⚠️ Your subscription expires in {mins} minutes."
             )
 
-        bot.send_message(user_id, msg_text, parse_mode="HTML")
+        # Send the permanent join-request link and pin that exact message in the user's chat.
+        link_message = bot.send_message(user_id, msg_text, parse_mode="HTML")
+        try:
+            bot.pin_chat_message(user_id, link_message.message_id, disable_notification=True)
+        except Exception as pin_error:
+            # Pinning must never prevent a successfully verified payment from being credited.
+            bot.send_message(ADMIN_ID, f"⚠️ Payment succeeded for user {user_id}, but the join-link message could not be pinned: {pin_error}")
+
         bot.send_message(
             ADMIN_ID,
             f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount})."
