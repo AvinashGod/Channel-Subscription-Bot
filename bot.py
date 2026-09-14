@@ -268,10 +268,10 @@ def show_welcome(chat_id, first_name, force_new=False):
         InlineKeyboardButton("🆘 SUPPORT", url="https://t.me/OggySubscriptionRobot")
     )
     safe_name = esc(first_name or "there")
-    default_template = ("<blockquote><tg-emoji emoji-id=\"6330181207552172474\">👋</tg-emoji> <b>Welcome, {first_name}!</b>\n\n"
-                        "I am your Premium Subscription Bot. <tg-emoji emoji-id=\"6330043854498046416\">🤖</tg-emoji>\n"
-                        "I can help you get instant access to our exclusive premium channels <tg-emoji emoji-id=\"6332571902313242695\">⚡</tg-emoji></blockquote>\n\n"
-                        "<tg-emoji emoji-id=\"5348122332432965936\">👇</tg-emoji> <b>Click on Buy Membership button to browse our premium channel plans!</b>")
+    default_template = ("<blockquote>👋 <b>Welcome, {first_name}!</b>\n\n"
+                        "I am your Premium Subscription Bot. 🤖\n"
+                        "I can help you get instant access to our exclusive premium channels ⚡</blockquote>\n\n"
+                        "👇 <b>Click on Buy Membership button to browse our premium channel plans!</b>")
     setting = settings_col.find_one({"key": "start_message"})
     template = setting.get("value") if setting and setting.get("value") else default_template
     try:
