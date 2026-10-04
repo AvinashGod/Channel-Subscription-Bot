@@ -1283,6 +1283,15 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
             coupons_col.update_one({"code": coupon_code}, {"$inc": {"used_count": 1}})
         coupon_sessions.pop(user_id, None)
 
+        # IMPORTANT: mark this payment as completed BEFORE making any Telegram
+        # notification calls. If the user's chat was deleted/blocked,
+        # bot.send_message(user_id, ...) can raise "chat not found". The old
+        # code kept the order in pending_payments until after that call, so the
+        # 5-second poller retried the same successful payment forever.
+        # Access/payment have already been recorded at this point, so remove the
+        # pending session now. This makes notification failures non-retriable.
+        pending_payments.pop(user_id, None)
+
         if is_lifetime:
             msg_text = (
                 "🎉 <b>Payment Verified!</b>\n\n"
@@ -1300,22 +1309,41 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
                 f"⚠️ Your subscription expires in {mins} minutes."
             )
 
-        # Send the permanent join-request link and pin that exact message in the user's chat.
-        link_message = bot.send_message(user_id, msg_text, parse_mode="HTML")
+        # Telegram notification is best-effort only. Payment/access has already
+        # been committed and pending_payments was cleared above. Therefore a
+        # "chat not found" (blocked/deleted user chat) must NEVER cause the
+        # payment to be retried by the 5-second checker.
         try:
-            bot.pin_chat_message(user_id, link_message.message_id, disable_notification=True)
-        except Exception as pin_error:
-            # Pinning must never prevent a successfully verified payment from being credited.
-            bot.send_message(ADMIN_ID, f"⚠️ Payment succeeded for user {user_id}, but the join-link message could not be pinned: {pin_error}")
+            link_message = bot.send_message(user_id, msg_text, parse_mode="HTML")
+            try:
+                bot.pin_chat_message(user_id, link_message.message_id, disable_notification=True)
+            except Exception as pin_error:
+                try:
+                    bot.send_message(ADMIN_ID, f"⚠️ Payment succeeded for user {user_id}, but the join-link message could not be pinned: {pin_error}")
+                except Exception:
+                    pass
+        except Exception as notify_error:
+            try:
+                bot.send_message(ADMIN_ID, f"⚠️ Payment succeeded for user {user_id}, but Telegram could not deliver the join link: {notify_error}")
+            except Exception:
+                pass
 
-        bot.send_message(
-            ADMIN_ID,
-            f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount})."
-        )
-        pending_payments.pop(user_id, None)
+        try:
+            bot.send_message(
+                ADMIN_ID,
+                f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount})."
+            )
+        except Exception:
+            pass
         return True
     except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Error during UPIQRPay auto-approval for user {user_id}, payment {payment_id}: {e}")
+        # Never allow an admin-notification failure to turn a completed payment
+        # back into a pending/retry loop.
+        try:
+            bot.send_message(ADMIN_ID, f"❌ Error during UPIQRPay auto-approval for user {user_id}, payment {payment_id}: {e}")
+        except Exception:
+            pass
+        pending_payments.pop(user_id, None)
         return False
     finally:
         with payment_lock:
