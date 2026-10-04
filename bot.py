@@ -269,9 +269,9 @@ def show_welcome(chat_id, first_name, force_new=False):
     )
     safe_name = esc(first_name or "there")
     default_template = ("<blockquote>👋 <b>Welcome, {first_name}!</b>\n\n"
-                        "I am your Premium Subscription Bot. 🤖\n"
-                        "I can help you get instant access to our exclusive premium channels ⚡</blockquote>\n\n"
-                        "👇 <b>Click on Buy Membership button to browse our premium channel plans!</b>")
+                         "I am your Premium Subscription Bot. 🤖\n"
+                         "I can help you get instant access to our exclusive premium channels ⚡</blockquote>\n\n"
+                         "👇 <b>Click on Buy Membership button to browse our premium channel plans!</b>")
     setting = settings_col.find_one({"key": "start_message"})
     template = setting.get("value") if setting and setting.get("value") else default_template
     try:
@@ -1070,19 +1070,35 @@ def user_pays(call):
         payload["redirect_url"] = PUBLIC_BASE_URL.rstrip('/') + "/payment-return"
         payload["webhook_url"] = PUBLIC_BASE_URL.rstrip('/') + "/webhook/upiqrpay"
 
-    try:
-        resp = requests.post(
-            "https://upiqrpay.in/api/v1/order/create",
-            headers={
-                "Authorization": f"Bearer {UPIQRPAY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=15
-        )
-        data = resp.json()
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ UPIQRPay order creation failed for user {call.from_user.id}: {e}")
+    # UPIQRPay can occasionally be slow. Retry one time for transient
+    # connection/read timeouts instead of immediately failing the payment flow.
+    data = None
+    last_error = None
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                "https://upiqrpay.in/api/v1/order/create",
+                headers={
+                    "Authorization": f"Bearer {UPIQRPAY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=(10, 25)
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            last_error = None
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            if attempt == 0:
+                continue
+        except Exception as e:
+            last_error = e
+            break
+
+    if data is None:
+        bot.send_message(ADMIN_ID, f"❌ UPIQRPay order creation failed for user {call.from_user.id}: {last_error}")
         bot.send_message(call.message.chat.id, "⚠️ Payment service is temporarily unavailable. Please try again in a moment.")
         return
 
@@ -1159,7 +1175,7 @@ def _upiqrpay_status(payment_id):
         resp = requests.get(
             f"https://upiqrpay.in/api/v1/order/status/{requests.utils.quote(str(payment_id), safe='')}",
             headers={"Authorization": f"Bearer {UPIQRPAY_API_KEY}"},
-            timeout=10
+            timeout=(10, 20)
         )
         return resp.json(), None
     except Exception as e:
@@ -1170,29 +1186,42 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
     """Verify amount/UTR and grant access exactly once."""
     payment_id = str(plan.get("payment_id"))
 
-    # Prevent the 5-second background checker and a simultaneous button tap
-    # from granting the same order twice.
     with payment_lock:
         if user_id in payment_processing:
             return False
         payment_processing.add(user_id)
 
     try:
+        from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
         paid_amount = payment.get("amount", plan["price"])
         try:
-            paid_amount_num = round(float(paid_amount), 2)
-        except (TypeError, ValueError):
-            paid_amount_num = -1
+            paid_amount_num = Decimal(str(paid_amount)).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            expected_price = Decimal(
+                str(plan.get("pay_amount", plan["price"]))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, TypeError, ValueError):
+            bot.send_message(
+                ADMIN_ID,
+                f"❌ Invalid payment amount for user {user_id}, payment {payment_id}: {paid_amount}"
+            )
+            pending_payments.pop(user_id, None)
+            return False
 
-        expected_price = float(plan.get("pay_amount", plan["price"]))
-        if abs(paid_amount_num - expected_price) > 0.01:
+        # Allow a maximum 1-paisa difference to avoid floating-point/processor
+        # rounding issues such as ₹69.00 vs ₹69.01.
+        if abs(paid_amount_num - expected_price) > Decimal("0.01"):
+            pending_payments.pop(user_id, None)
             bot.send_message(
                 user_id,
-                f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{expected_price:.2f}. Contact admin."
+                f"⚠️ Amount mismatch — paid ₹{paid_amount_num:.2f}, expected ₹{expected_price:.2f}. Contact admin."
             )
             bot.send_message(
                 ADMIN_ID,
-                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{expected_price:.2f}, payment {payment_id}"
+                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount_num:.2f}, "
+                f"expected ₹{expected_price:.2f}, payment {payment_id}"
             )
             return False
 
@@ -1204,8 +1233,6 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
         ch_id, mins = plan["ch_id"], plan["mins"]
         link, is_lifetime = create_access(user_id, ch_id, mins)
 
-        # Record the payment before notifying the user. The unique UTR check
-        # above plus payment_lock prevents duplicate grants in this process.
         try:
             used_utrs_col.insert_one({
                 "utr": utr,
@@ -1213,14 +1240,13 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
                 "order_id": payment.get("order_id", plan.get("order_id")),
                 "user_id": user_id,
                 "ch_id": ch_id,
-                "amount": round(expected_price, 2),
+                "amount": float(expected_price),
                 "original_amount": round(float(plan.get("price", expected_price)), 2),
                 "coupon_code": plan.get("coupon_code"),
                 "discount_percent": int(plan.get("discount_percent", 0)),
                 "used_at": datetime.now()
             })
         except Exception:
-            # A duplicate-key/index race should not result in another credit.
             if used_utrs_col.find_one({"utr": utr}):
                 pending_payments.pop(user_id, None)
                 return False
@@ -1228,42 +1254,73 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
 
         coupon_code = plan.get("coupon_code")
         if coupon_code:
-            coupons_col.update_one({"code": coupon_code}, {"$inc": {"used_count": 1}})
+            coupons_col.update_one(
+                {"code": coupon_code},
+                {"$inc": {"used_count": 1}}
+            )
         coupon_sessions.pop(user_id, None)
 
         if is_lifetime:
             msg_text = (
-                "🎉 <b>Payment Verified!</b>\n\n"
-                "Subscription: Lifetime Membership ♾️\n\n"
-                f"Join Request Link: {link.invite_link}\n\n"
-                "📩 Send a join request using this link. Your request will be approved automatically while your subscription is active.\n"
+                "🎉 <b>Payment Verified!</b>\\n\\n"
+                "Subscription: Lifetime Membership ♾️\\n\\n"
+                f"Join Request Link: {link.invite_link}\\n\\n"
+                "📩 Send a join request using this link. Your request will be approved automatically while your subscription is active.\\n"
                 "✅ This is a lifetime membership — no expiry!"
             )
         else:
             msg_text = (
-                "🎉 <b>Payment Verified!</b>\n\n"
-                f"Subscription: {mins} Minutes\n\n"
-                f"Join Request Link: {link.invite_link}\n\n"
-                "📩 Send a join request using this link. Your request will be approved automatically while your subscription is active.\n"
+                "🎉 <b>Payment Verified!</b>\\n\\n"
+                f"Subscription: {mins} Minutes\\n\\n"
+                f"Join Request Link: {link.invite_link}\\n\\n"
+                "📩 Send a join request using this link. Your request will be approved automatically while your subscription is active.\\n"
                 f"⚠️ Your subscription expires in {mins} minutes."
             )
 
-        # Send the permanent join-request link and pin that exact message in the user's chat.
-        link_message = bot.send_message(user_id, msg_text, parse_mode="HTML")
+        # Payment is now fully recorded and access has been granted.
+        # Remove it from the polling queue BEFORE any Telegram notification,
+        # so a Telegram-side error (e.g. "chat not found") cannot cause the
+        # same payment to be processed every 5 seconds.
+        pending_payments.pop(user_id, None)
+
         try:
-            bot.pin_chat_message(user_id, link_message.message_id, disable_notification=True)
-        except Exception as pin_error:
-            # Pinning must never prevent a successfully verified payment from being credited.
-            bot.send_message(ADMIN_ID, f"⚠️ Payment succeeded for user {user_id}, but the join-link message could not be pinned: {pin_error}")
+            link_message = bot.send_message(user_id, msg_text, parse_mode="HTML")
+            try:
+                bot.pin_chat_message(
+                    user_id,
+                    link_message.message_id,
+                    disable_notification=True
+                )
+            except Exception as pin_error:
+                bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Payment succeeded for user {user_id}, but the join-link message "
+                    f"could not be pinned: {pin_error}"
+                )
+        except Exception as notify_error:
+            # Payment is already safely recorded; do not retry the payment.
+            bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Payment succeeded for user {user_id}, but Telegram could not "
+                f"deliver the join-link message: {notify_error}"
+            )
 
         bot.send_message(
             ADMIN_ID,
-            f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount})."
+            f"✅ Auto-approved user {user_id} for "
+            f"{'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay "
+            f"payment {payment_id} (₹{paid_amount_num:.2f})."
         )
-        pending_payments.pop(user_id, None)
         return True
+
     except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Error during UPIQRPay auto-approval for user {user_id}, payment {payment_id}: {e}")
+        # Only an unexpected failure before the payment is safely recorded
+        # should remain eligible for a retry.
+        bot.send_message(
+            ADMIN_ID,
+            f"❌ Error during UPIQRPay auto-approval for user {user_id}, "
+            f"payment {payment_id}: {e}"
+        )
         return False
     finally:
         with payment_lock:
