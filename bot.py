@@ -195,9 +195,18 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
         markup.add(InlineKeyboardButton(plan_button_text(p_time, p_val), callback_data=f"select_{ch_id}_{p_time}"))
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtolist"))
 
-    if ch_data.get('description'):
+    if ch_data.get('description_html'):
+        # description_html already contains the exact Telegram entities supplied
+        # by the admin (custom emojis, quotes, bold/italic, links, etc.). Do not
+        # escape it or wrap it in another blockquote, otherwise the original
+        # formatting gets changed.
         caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
-                   f"<blockquote>{ch_data.get('description_html') or esc(ch_data['description'])}</blockquote>\n\n"
+                   f"{ch_data['description_html']}\n\n"
+                   f"Please select a subscription plan below:")
+    elif ch_data.get('description'):
+        # Backward compatibility for descriptions saved before entity capture.
+        caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
+                   f"<blockquote>{esc(ch_data['description'])}</blockquote>\n\n"
                    f"Please select a subscription plan below:")
     else:
         caption = f"Welcome!\n\nYou are joining: <b>{disp_name_html(ch_data)}</b>.\n\nPlease select a subscription plan below:"
