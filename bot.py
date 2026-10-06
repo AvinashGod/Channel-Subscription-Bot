@@ -9,7 +9,6 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMedia
 from telebot.formatting import apply_html_entities
 from pymongo import MongoClient
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request
 from threading import Thread, Lock
@@ -1233,23 +1232,23 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
     try:
         paid_amount = payment.get("amount", plan["price"])
         try:
-            paid_amount_num = Decimal(str(paid_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            expected_price = Decimal(str(plan.get("pay_amount", plan["price"]))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        except (InvalidOperation, TypeError, ValueError):
-            paid_amount_num = Decimal("-1")
-            expected_price = Decimal(str(plan.get("pay_amount", plan["price"]))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            paid_amount_num = round(float(paid_amount), 2)
+        except (TypeError, ValueError):
+            paid_amount_num = -1
 
-        # UPIQRPay can report exactly ₹0.01 above the requested amount.
-        # Accept that gateway adjustment, but reject anything larger.
-        if abs(paid_amount_num - expected_price) > Decimal("0.01"):
+        expected_price = float(plan.get("pay_amount", plan["price"]))
+        # Allow an overpayment of up to ₹0.99, but never accept an underpayment.
+        # Example: expected ₹99.00 => ₹99.00 through ₹99.99 is approved;
+        # ₹98.99 or ₹100.00 is rejected.
+        if paid_amount_num < expected_price or paid_amount_num >= expected_price + 1.00:
             pending_payments.pop(user_id, None)
             bot.send_message(
                 user_id,
-                f"⚠️ Amount mismatch — paid ₹{paid_amount_num:.2f}, expected ₹{expected_price:.2f}. Contact admin."
+                f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{expected_price:.2f}. Contact admin."
             )
             bot.send_message(
                 ADMIN_ID,
-                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount_num:.2f}, expected ₹{expected_price:.2f}, payment {payment_id}"
+                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{expected_price:.2f}, payment {payment_id}"
             )
             return False
 
@@ -1270,8 +1269,8 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
                 "order_id": payment.get("order_id", plan.get("order_id")),
                 "user_id": user_id,
                 "ch_id": ch_id,
-                "amount": float(expected_price),
-                "original_amount": float(Decimal(str(plan.get("price", expected_price))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                "amount": round(expected_price, 2),
+                "original_amount": round(float(plan.get("price", expected_price)), 2),
                 "coupon_code": plan.get("coupon_code"),
                 "discount_percent": int(plan.get("discount_percent", 0)),
                 "used_at": datetime.now()
