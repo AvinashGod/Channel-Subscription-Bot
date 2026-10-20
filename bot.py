@@ -1185,25 +1185,33 @@ def user_pays(call):
     payment_id = payment.get("payment_id")
     pay_url = payment.get("pay_url") or payment.get("upi_link")
     qr_code = payment.get("qr_code")
-    # If the provider explicitly reports a generated-order amount, verify it
-    # matches the requested discounted total before showing its QR. Never show
-    # a QR for a different amount while displaying the locally calculated price.
+    # UPIQRPay may add a small amount adjustment (e.g. ₹0.01) to make
+    # concurrent orders distinguishable. Use its returned payable amount as
+    # the source of truth, display that exact amount, and verify payment against it.
     provider_amount = payment.get("amount")
+    gateway_adjustment = 0.0
     if provider_amount is not None:
         try:
             provider_amount_num = round(float(provider_amount), 2)
         except (TypeError, ValueError):
             provider_amount_num = None
-        if provider_amount_num is None or provider_amount_num != round(pay_amount, 2):
+        requested_amount_num = round(float(pay_amount), 2)
+        # Accept only a non-negative adjustment smaller than ₹1.00. Refuse
+        # underpayment amounts or larger/unexpected changes rather than silently
+        # charging the customer a materially different price.
+        if (provider_amount_num is None or provider_amount_num < requested_amount_num
+                or provider_amount_num >= requested_amount_num + 1.00):
             bot.send_message(
                 ADMIN_ID,
-                f"❌ UPIQRPay amount mismatch when creating order {payment_id}: requested ₹{pay_amount}, provider returned ₹{provider_amount}. QR was not sent."
+                f"❌ UPIQRPay amount mismatch when creating order {payment_id}: requested ₹{requested_amount_num:.2f}, provider returned ₹{provider_amount}. QR was not sent."
             )
             bot.send_message(
                 call.message.chat.id,
-                "⚠️ Payment provider returned a QR/order with a different amount. No payment QR was sent. Please try again later or contact admin."
+                "⚠️ Payment provider returned an unexpected amount. No payment QR was sent. Please try again later or contact admin."
             )
             return
+        gateway_adjustment = round(provider_amount_num - requested_amount_num, 2)
+        pay_amount = provider_amount_num
     if not payment_id or not qr_code:
         bot.send_message(ADMIN_ID, f"❌ UPIQRPay returned an incomplete order response: {data}")
         bot.send_message(call.message.chat.id, "⚠️ Payment order could not be created. Please contact admin.")
@@ -1217,7 +1225,10 @@ def user_pays(call):
     price_display = f"₹{whole_rupee(price)}"
     amount_line = f"Price: {price_display}"
     if discount_percent:
-        amount_line += f"\n🎟️ Coupon {coupon_code}: -{discount_percent}%\n💰 Pay: ₹{pay_amount}"
+        amount_line += f"\n🎟️ Coupon {coupon_code}: -{discount_percent}%"
+    amount_line += f"\n💰 Pay: ₹{pay_amount:.2f}" if gateway_adjustment else f"\n💰 Pay: ₹{pay_amount}"
+    if gateway_adjustment:
+        amount_line += f"\nℹ️ Gateway adjustment: +₹{gateway_adjustment:.2f}"
 
     # Use the actual payment QR returned by UPIQRPay.
     # Do NOT generate a QR from pay_url: pay_url opens a web payment page and
