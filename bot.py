@@ -150,9 +150,8 @@ def plan_label_html(p_val):
         return p_val.get('label_html') or esc(p_val.get('label')) if p_val.get('label') else None
     return None
 
-def plan_button_text(p_time, p_val, discount_percent=0):
+def plan_button_text(p_time, p_val):
     price, custom_label = plan_info(p_val)
-    original_price = float(price)
     if str(p_time).strip().lower() == "lifetime":
         duration_str = "Lifetime"
     elif int(p_time) < 60:
@@ -161,15 +160,9 @@ def plan_button_text(p_time, p_val, discount_percent=0):
         days = int(p_time) // 1440
         duration_str = f"{days} Day" if days == 1 else f"{days} Days"
 
-    if discount_percent:
-        discounted_price = round(original_price * (100 - discount_percent) / 100, 2)
-        price_text = f"₹{discounted_price:.2f} (was ₹{original_price:g})"
-    else:
-        price_text = f"₹{price}"
-
     if custom_label:
-        return f"{custom_label} - {price_text} ({duration_str})"
-    return f"💳 {duration_str} - {price_text}"
+        return f"{custom_label} - ₹{price} ({duration_str})"
+    return f"💳 {duration_str} - ₹{price}"
 
 def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=False):
     ch_data = channels_col.find_one({"channel_id": ch_id})
@@ -197,27 +190,41 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
                 reply_markup=markup, parse_mode="HTML", force_new=force_new)
             return
 
-    # Apply the current user's valid coupon to the displayed plan-button prices.
-    # The stored plan prices are never changed; payment calculation remains in user_pays().
-    button_discount_percent = 0
-    if user_id is not None:
-        active_coupon_code = coupon_sessions.get(user_id)
-        active_coupon = coupons_col.find_one({"code": active_coupon_code}) if active_coupon_code else None
-        if active_coupon and active_coupon.get("active", True) is not False:
-            coupon_expiry = active_coupon.get("expires_at")
-            coupon_max_uses = active_coupon.get("max_uses")
-            coupon_usage_valid = (coupon_max_uses is None or
-                                  int(active_coupon.get("used_count", 0)) < int(coupon_max_uses))
-            coupon_time_valid = not coupon_expiry or coupon_expiry > datetime.now()
-            if coupon_usage_valid and coupon_time_valid:
-                button_discount_percent = max(0, min(99, int(active_coupon.get("percent", 0))))
-
     markup = InlineKeyboardMarkup()
+    # Show this user's currently valid coupon discount in plan buttons, without
+    # modifying the original prices stored in MongoDB.
+    active_coupon_code = coupon_sessions.get(user_id) if user_id is not None else None
+    active_coupon = coupons_col.find_one({"code": active_coupon_code}) if active_coupon_code else None
+    coupon_percent = 0
+    if active_coupon:
+        expires_at = active_coupon.get("expires_at")
+        max_uses = active_coupon.get("max_uses")
+        if (active_coupon.get("active", True) is not False
+                and (not expires_at or expires_at > datetime.now())
+                and (max_uses is None or int(active_coupon.get("used_count", 0)) < int(max_uses))):
+            coupon_percent = int(active_coupon.get("percent", 0))
+        else:
+            coupon_sessions.pop(user_id, None)
+            active_coupon_code = None
+
     for p_time, p_val in ch_data['plans'].items():
-        markup.add(InlineKeyboardButton(
-            plan_button_text(p_time, p_val, button_discount_percent),
-            callback_data=f"select_{ch_id}_{p_time}"
-        ))
+        button_text = plan_button_text(p_time, p_val)
+        if coupon_percent:
+            original_price, custom_label = plan_info(p_val)
+            try:
+                original_price_num = float(original_price)
+                discounted_price = round(original_price_num * (100 - coupon_percent) / 100, 2)
+                if custom_label:
+                    duration_part = button_text.split(" - ₹", 1)[1] if " - ₹" in button_text else ""
+                    button_text = f"{custom_label} - ₹{discounted_price:.2f} (was ₹{original_price_num:g})"
+                    if duration_part and "(" in duration_part:
+                        button_text += f" ({duration_part.split('(', 1)[1]}"
+                else:
+                    # Keep the existing duration label and append the original price.
+                    button_text = button_text.replace(f"₹{original_price}", f"₹{discounted_price:.2f} (was ₹{original_price_num:g})", 1)
+            except (TypeError, ValueError):
+                pass
+        markup.add(InlineKeyboardButton(button_text, callback_data=f"select_{ch_id}_{p_time}"))
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtolist"))
 
     if ch_data.get('description_html'):
@@ -1136,8 +1143,10 @@ def user_pays(call):
     pay_amount = round(price * (100 - discount_percent) / 100, 2)
     order_id = f"TG_{call.from_user.id}_{uuid.uuid4().hex[:12]}"
 
+    # Send an explicit two-decimal amount to the gateway (e.g. "69.30"),
+    # avoiding any float serialization ambiguity.
     payload = {
-        "amount": pay_amount,
+        "amount": f"{pay_amount:.2f}",
         "order_id": order_id,
         "customer_name": call.from_user.first_name or "Telegram User",
         "customer_phone": "9999999999",
@@ -1170,6 +1179,25 @@ def user_pays(call):
     payment_id = payment.get("payment_id")
     pay_url = payment.get("pay_url") or payment.get("upi_link")
     qr_code = payment.get("qr_code")
+    # If the provider explicitly reports a generated-order amount, verify it
+    # matches the requested discounted total before showing its QR. Never show
+    # a QR for a different amount while displaying the locally calculated price.
+    provider_amount = payment.get("amount")
+    if provider_amount is not None:
+        try:
+            provider_amount_num = round(float(provider_amount), 2)
+        except (TypeError, ValueError):
+            provider_amount_num = None
+        if provider_amount_num is None or provider_amount_num != round(pay_amount, 2):
+            bot.send_message(
+                ADMIN_ID,
+                f"❌ UPIQRPay amount mismatch when creating order {payment_id}: requested ₹{pay_amount:.2f}, provider returned ₹{provider_amount}. QR was not sent."
+            )
+            bot.send_message(
+                call.message.chat.id,
+                "⚠️ Payment provider returned a QR/order with a different amount. No payment QR was sent. Please try again later or contact admin."
+            )
+            return
     if not payment_id or not qr_code:
         bot.send_message(ADMIN_ID, f"❌ UPIQRPay returned an incomplete order response: {data}")
         bot.send_message(call.message.chat.id, "⚠️ Payment order could not be created. Please contact admin.")
