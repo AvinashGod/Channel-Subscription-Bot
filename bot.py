@@ -150,8 +150,9 @@ def plan_label_html(p_val):
         return p_val.get('label_html') or esc(p_val.get('label')) if p_val.get('label') else None
     return None
 
-def plan_button_text(p_time, p_val):
+def plan_button_text(p_time, p_val, discount_percent=0):
     price, custom_label = plan_info(p_val)
+    original_price = float(price)
     if str(p_time).strip().lower() == "lifetime":
         duration_str = "Lifetime"
     elif int(p_time) < 60:
@@ -160,9 +161,15 @@ def plan_button_text(p_time, p_val):
         days = int(p_time) // 1440
         duration_str = f"{days} Day" if days == 1 else f"{days} Days"
 
+    if discount_percent:
+        discounted_price = round(original_price * (100 - discount_percent) / 100, 2)
+        price_text = f"₹{discounted_price:.2f} (was ₹{original_price:g})"
+    else:
+        price_text = f"₹{price}"
+
     if custom_label:
-        return f"{custom_label} - ₹{price} ({duration_str})"
-    return f"💳 {duration_str} - ₹{price}"
+        return f"{custom_label} - {price_text} ({duration_str})"
+    return f"💳 {duration_str} - {price_text}"
 
 def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=False):
     ch_data = channels_col.find_one({"channel_id": ch_id})
@@ -190,9 +197,27 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
                 reply_markup=markup, parse_mode="HTML", force_new=force_new)
             return
 
+    # Apply the current user's valid coupon to the displayed plan-button prices.
+    # The stored plan prices are never changed; payment calculation remains in user_pays().
+    button_discount_percent = 0
+    if user_id is not None:
+        active_coupon_code = coupon_sessions.get(user_id)
+        active_coupon = coupons_col.find_one({"code": active_coupon_code}) if active_coupon_code else None
+        if active_coupon and active_coupon.get("active", True) is not False:
+            coupon_expiry = active_coupon.get("expires_at")
+            coupon_max_uses = active_coupon.get("max_uses")
+            coupon_usage_valid = (coupon_max_uses is None or
+                                  int(active_coupon.get("used_count", 0)) < int(coupon_max_uses))
+            coupon_time_valid = not coupon_expiry or coupon_expiry > datetime.now()
+            if coupon_usage_valid and coupon_time_valid:
+                button_discount_percent = max(0, min(99, int(active_coupon.get("percent", 0))))
+
     markup = InlineKeyboardMarkup()
     for p_time, p_val in ch_data['plans'].items():
-        markup.add(InlineKeyboardButton(plan_button_text(p_time, p_val), callback_data=f"select_{ch_id}_{p_time}"))
+        markup.add(InlineKeyboardButton(
+            plan_button_text(p_time, p_val, button_discount_percent),
+            callback_data=f"select_{ch_id}_{p_time}"
+        ))
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtolist"))
 
     if ch_data.get('description_html'):
