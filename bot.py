@@ -13,6 +13,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request
 from threading import Thread, Lock
 from io import BytesIO
+from decimal import Decimal, ROUND_HALF_UP
 
 # --- RENDER KEEP-ALIVE SERVER ---
 app = Flask('')
@@ -150,8 +151,13 @@ def plan_label_html(p_val):
         return p_val.get('label_html') or esc(p_val.get('label')) if p_val.get('label') else None
     return None
 
+def whole_rupee(amount):
+    """Round a positive INR amount to the nearest whole rupee (half-up)."""
+    return int(Decimal(str(amount)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
 def plan_button_text(p_time, p_val):
     price, custom_label = plan_info(p_val)
+    price = whole_rupee(price)
     if str(p_time).strip().lower() == "lifetime":
         duration_str = "Lifetime"
     elif int(p_time) < 60:
@@ -213,15 +219,15 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
             original_price, custom_label = plan_info(p_val)
             try:
                 original_price_num = float(original_price)
-                discounted_price = round(original_price_num * (100 - coupon_percent) / 100, 2)
+                discounted_price = whole_rupee(original_price_num * (100 - coupon_percent) / 100)
                 if custom_label:
                     duration_part = button_text.split(" - ₹", 1)[1] if " - ₹" in button_text else ""
-                    button_text = f"{custom_label} - ₹{discounted_price:.2f} (was ₹{original_price_num:g})"
+                    button_text = f"{custom_label} - ₹{discounted_price} (was ₹{original_price_num:g})"
                     if duration_part and "(" in duration_part:
                         button_text += f" ({duration_part.split('(', 1)[1]}"
                 else:
                     # Keep the existing duration label and append the original price.
-                    button_text = button_text.replace(f"₹{original_price}", f"₹{discounted_price:.2f} (was ₹{original_price_num:g})", 1)
+                    button_text = button_text.replace(f"₹{original_price}", f"₹{discounted_price} (was ₹{original_price_num:g})", 1)
             except (TypeError, ValueError):
                 pass
         markup.add(InlineKeyboardButton(button_text, callback_data=f"select_{ch_id}_{p_time}"))
@@ -1140,13 +1146,13 @@ def user_pays(call):
             coupon_sessions.pop(call.from_user.id, None)
         else:
             discount_percent = int(coupon.get("percent", 0))
-    pay_amount = round(price * (100 - discount_percent) / 100, 2)
+    pay_amount = whole_rupee(price * (100 - discount_percent) / 100)
     order_id = f"TG_{call.from_user.id}_{uuid.uuid4().hex[:12]}"
 
     # Send an explicit two-decimal amount to the gateway (e.g. "69.30"),
     # avoiding any float serialization ambiguity.
     payload = {
-        "amount": f"{pay_amount:.2f}",
+        "amount": str(pay_amount),
         "order_id": order_id,
         "customer_name": call.from_user.first_name or "Telegram User",
         "customer_phone": "9999999999",
@@ -1191,7 +1197,7 @@ def user_pays(call):
         if provider_amount_num is None or provider_amount_num != round(pay_amount, 2):
             bot.send_message(
                 ADMIN_ID,
-                f"❌ UPIQRPay amount mismatch when creating order {payment_id}: requested ₹{pay_amount:.2f}, provider returned ₹{provider_amount}. QR was not sent."
+                f"❌ UPIQRPay amount mismatch when creating order {payment_id}: requested ₹{pay_amount}, provider returned ₹{provider_amount}. QR was not sent."
             )
             bot.send_message(
                 call.message.chat.id,
@@ -1208,10 +1214,10 @@ def user_pays(call):
         plan_label = custom_label_html or esc(custom_label)
     else:
         plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
-    price_display = f"₹{price:.2f}" if price % 1 else f"₹{int(price)}"
+    price_display = f"₹{whole_rupee(price)}"
     amount_line = f"Price: {price_display}"
     if discount_percent:
-        amount_line += f"\n🎟️ Coupon {coupon_code}: -{discount_percent}%\n💰 Pay: ₹{pay_amount:.2f}"
+        amount_line += f"\n🎟️ Coupon {coupon_code}: -{discount_percent}%\n💰 Pay: ₹{pay_amount}"
 
     # Use the actual payment QR returned by UPIQRPay.
     # Do NOT generate a QR from pay_url: pay_url opens a web payment page and
@@ -1297,11 +1303,11 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
             pending_payments.pop(user_id, None)
             bot.send_message(
                 user_id,
-                f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{expected_price:.2f}. Contact admin."
+                f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{whole_rupee(expected_price)}. Contact admin."
             )
             bot.send_message(
                 ADMIN_ID,
-                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{expected_price:.2f}, payment {payment_id}"
+                f"⚠️ Amount mismatch: user {user_id}, paid ₹{paid_amount}, expected ₹{whole_rupee(expected_price)}, payment {payment_id}"
             )
             return False
 
