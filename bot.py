@@ -117,26 +117,9 @@ def sync_channel_name(ch_data):
     return ch_data
 
 def disp_name(ch_data):
-    """Plain display name for Telegram UI elements such as inline buttons."""
+    """Returns the admin-set display name if configured, otherwise the current Telegram channel title."""
     ch_data = sync_channel_name(ch_data)
-    return ch_data.get('display_name_plain') or ch_data.get('display_name') or ch_data['name']
-
-def disp_name_html(ch_data):
-    """HTML display name for normal messages; preserves Premium/custom emoji entities."""
-    ch_data = sync_channel_name(ch_data)
-    return ch_data.get('display_name_html') or esc(ch_data.get('display_name_plain') or ch_data.get('display_name') or ch_data['name'])
-
-def capture_message_html(message):
-    """Convert Telegram text/caption entities (including custom emojis) to reusable HTML."""
-    text = message.text if getattr(message, 'text', None) is not None else getattr(message, 'caption', None)
-    entities = getattr(message, 'entities', None) if getattr(message, 'text', None) is not None else getattr(message, 'caption_entities', None)
-    if text is None:
-        return None, None
-    html_text = apply_html_entities(text, entities)
-    return html_text, text.strip()
-
-def capture_text_or_command(message):
-    return (message.text or message.caption or '').strip()
+    return ch_data.get('display_name') or ch_data['name']
 
 def plan_info(p_val):
     """A plan value can be a plain price string (legacy / no custom label) or a dict {'price':..,'label':..}.
@@ -145,13 +128,11 @@ def plan_info(p_val):
         return p_val.get('price'), p_val.get('label')
     return p_val, None
 
-def plan_label_html(p_val):
-    if isinstance(p_val, dict):
-        return p_val.get('label_html') or esc(p_val.get('label')) if p_val.get('label') else None
-    return None
-
-def plan_button_text(p_time, p_val):
+def plan_button_text(p_time, p_val, discount_percent=0):
     price, custom_label = plan_info(p_val)
+    original_price = float(price)
+    discounted_price = round(original_price * (100 - int(discount_percent)) / 100, 2)
+
     if str(p_time).strip().lower() == "lifetime":
         duration_str = "Lifetime"
     elif int(p_time) < 60:
@@ -160,9 +141,36 @@ def plan_button_text(p_time, p_val):
         days = int(p_time) // 1440
         duration_str = f"{days} Day" if days == 1 else f"{days} Days"
 
+    if discount_percent:
+        price_text = f"₹{discounted_price:.2f} (was ₹{original_price:.2f})"
+    else:
+        price_text = f"₹{original_price:.2f}" if original_price % 1 else f"₹{int(original_price)}"
+
     if custom_label:
-        return f"{custom_label} - ₹{price} ({duration_str})"
-    return f"💳 {duration_str} - ₹{price}"
+        return f"{custom_label} - {price_text} ({duration_str})"
+    return f"💳 {duration_str} - {price_text}"
+
+
+def get_active_coupon_discount(user_id):
+    """Return the valid coupon percentage for this user's current session, or 0."""
+    code = coupon_sessions.get(user_id)
+    if not code:
+        return 0
+    coupon = coupons_col.find_one({"code": code})
+    if not coupon or coupon.get("active", True) is False:
+        coupon_sessions.pop(user_id, None)
+        return 0
+    expires_at = coupon.get("expires_at")
+    max_uses = coupon.get("max_uses")
+    if ((expires_at and expires_at <= datetime.now()) or
+            (max_uses is not None and int(coupon.get("used_count", 0)) >= int(max_uses))):
+        coupon_sessions.pop(user_id, None)
+        return 0
+    try:
+        percent = int(coupon.get("percent", 0))
+    except (TypeError, ValueError):
+        return 0
+    return percent if 0 < percent < 100 else 0
 
 def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=False):
     ch_data = channels_col.find_one({"channel_id": ch_id})
@@ -186,30 +194,23 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
             markup.add(InlineKeyboardButton("❌ No", callback_data="extendno"))
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtolist"))
             send_page(chat_id,
-                f"ℹ️ You already have an active plan for <b>{disp_name_html(ch_data)}</b>.\n\nStatus: {status_line}\n\nDo you want to buy more time and extend it?",
+                f"ℹ️ You already have an active plan for <b>{esc(disp_name(ch_data))}</b>.\n\nStatus: {status_line}\n\nDo you want to buy more time and extend it?",
                 reply_markup=markup, parse_mode="HTML", force_new=force_new)
             return
 
     markup = InlineKeyboardMarkup()
+    discount_percent = get_active_coupon_discount(user_id) if user_id is not None else 0
     for p_time, p_val in ch_data['plans'].items():
-        markup.add(InlineKeyboardButton(plan_button_text(p_time, p_val), callback_data=f"select_{ch_id}_{p_time}"))
+        button_text = plan_button_text(p_time, p_val, discount_percent)
+        markup.add(InlineKeyboardButton(button_text, callback_data=f"select_{ch_id}_{p_time}"))
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="backtolist"))
 
-    if ch_data.get('description_html'):
-        # description_html already contains the exact Telegram entities supplied
-        # by the admin (custom emojis, quotes, bold/italic, links, etc.). Do not
-        # escape it or wrap it in another blockquote, otherwise the original
-        # formatting gets changed.
-        caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
-                   f"{ch_data['description_html']}\n\n"
-                   f"Please select a subscription plan below:")
-    elif ch_data.get('description'):
-        # Backward compatibility for descriptions saved before entity capture.
+    if ch_data.get('description'):
         caption = (f"📋 <b>SELECTED CHANNEL DETAILS</b>\n\n"
                    f"<blockquote>{esc(ch_data['description'])}</blockquote>\n\n"
                    f"Please select a subscription plan below:")
     else:
-        caption = f"Welcome!\n\nYou are joining: <b>{disp_name_html(ch_data)}</b>.\n\nPlease select a subscription plan below:"
+        caption = f"Welcome!\n\nYou are joining: <b>{esc(disp_name(ch_data))}</b>.\n\nPlease select a subscription plan below:"
 
     send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="HTML", force_new=force_new)
 
@@ -943,26 +944,24 @@ def adm_editchmsg(call):
     bot.register_next_step_handler(msg, process_editchmsg)
 
 def process_editchmsg(message):
-    raw = capture_text_or_command(message)
-    if raw == "/cancel":
+    text = (message.text or "").strip()
+    if text == "/cancel":
         bot.send_message(ADMIN_ID, "Cancelled — channel list message unchanged.")
         return
-    if raw == "/reset":
+    if text == "/reset":
         settings_col.delete_one({"key": "channel_list_message"})
         bot.send_message(ADMIN_ID, "✅ Select Channel message reset to the default message.")
         return
-    html_text, plain_text = capture_message_html(message)
-    if not html_text:
-        bot.send_message(ADMIN_ID, "❌ Please send text. Premium/custom emojis and formatting are supported automatically.")
+    if not text:
+        bot.send_message(ADMIN_ID, "❌ Please send some text, or /cancel.")
         return
     try:
-        preview = html_text.replace("{first_name}", esc("Preview"))
-        bot.send_message(ADMIN_ID, preview, parse_mode="HTML")
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Could not process the formatting/emoji: {e}")
+        bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid HTML formatting. Please check your tags and try again.")
         return
-    settings_col.update_one({"key": "channel_list_message"}, {"$set": {"value": html_text}}, upsert=True)
-    bot.send_message(ADMIN_ID, "✅ Select Channel message updated! Premium emojis and formatting were captured automatically.")
+    settings_col.update_one({"key": "channel_list_message"}, {"$set": {"value": text}}, upsert=True)
+    bot.send_message(ADMIN_ID, "✅ Select Channel message updated! Open Buy Membership to preview it.")
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_setimg")
 def adm_setimg(call):
@@ -1150,9 +1149,8 @@ def user_pays(call):
         bot.send_message(call.message.chat.id, "⚠️ Payment order could not be created. Please contact admin.")
         return
 
-    custom_label_html = plan_label_html(ch_data['plans'][mins])
     if custom_label:
-        plan_label = custom_label_html or esc(custom_label)
+        plan_label = custom_label
     else:
         plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
     price_display = f"₹{price:.2f}" if price % 1 else f"₹{int(price)}"
@@ -1237,11 +1235,7 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
             paid_amount_num = -1
 
         expected_price = float(plan.get("pay_amount", plan["price"]))
-        # Allow an overpayment of up to ₹0.99, but never accept an underpayment.
-        # Example: expected ₹99.00 => ₹99.00 through ₹99.99 is approved;
-        # ₹98.99 or ₹100.00 is rejected.
-        if paid_amount_num < expected_price or paid_amount_num >= expected_price + 1.00:
-            pending_payments.pop(user_id, None)
+        if abs(paid_amount_num - expected_price) > 0.01:
             bot.send_message(
                 user_id,
                 f"⚠️ Amount mismatch — paid ₹{paid_amount}, expected ₹{expected_price:.2f}. Contact admin."
@@ -1287,15 +1281,6 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
             coupons_col.update_one({"code": coupon_code}, {"$inc": {"used_count": 1}})
         coupon_sessions.pop(user_id, None)
 
-        # IMPORTANT: mark this payment as completed BEFORE making any Telegram
-        # notification calls. If the user's chat was deleted/blocked,
-        # bot.send_message(user_id, ...) can raise "chat not found". The old
-        # code kept the order in pending_payments until after that call, so the
-        # 5-second poller retried the same successful payment forever.
-        # Access/payment have already been recorded at this point, so remove the
-        # pending session now. This makes notification failures non-retriable.
-        pending_payments.pop(user_id, None)
-
         if is_lifetime:
             msg_text = (
                 "🎉 <b>Payment Verified!</b>\n\n"
@@ -1313,41 +1298,22 @@ def complete_successful_payment(user_id, plan, payment, source="manual"):
                 f"⚠️ Your subscription expires in {mins} minutes."
             )
 
-        # Telegram notification is best-effort only. Payment/access has already
-        # been committed and pending_payments was cleared above. Therefore a
-        # "chat not found" (blocked/deleted user chat) must NEVER cause the
-        # payment to be retried by the 5-second checker.
+        # Send the permanent join-request link and pin that exact message in the user's chat.
+        link_message = bot.send_message(user_id, msg_text, parse_mode="HTML")
         try:
-            link_message = bot.send_message(user_id, msg_text, parse_mode="HTML")
-            try:
-                bot.pin_chat_message(user_id, link_message.message_id, disable_notification=True)
-            except Exception as pin_error:
-                try:
-                    bot.send_message(ADMIN_ID, f"⚠️ Payment succeeded for user {user_id}, but the join-link message could not be pinned: {pin_error}")
-                except Exception:
-                    pass
-        except Exception as notify_error:
-            try:
-                bot.send_message(ADMIN_ID, f"⚠️ Payment succeeded for user {user_id}, but Telegram could not deliver the join link: {notify_error}")
-            except Exception:
-                pass
+            bot.pin_chat_message(user_id, link_message.message_id, disable_notification=True)
+        except Exception as pin_error:
+            # Pinning must never prevent a successfully verified payment from being credited.
+            bot.send_message(ADMIN_ID, f"⚠️ Payment succeeded for user {user_id}, but the join-link message could not be pinned: {pin_error}")
 
-        try:
-            bot.send_message(
-                ADMIN_ID,
-                f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount})."
-            )
-        except Exception:
-            pass
+        bot.send_message(
+            ADMIN_ID,
+            f"✅ Auto-approved user {user_id} for {'Lifetime' if is_lifetime else mins + ' mins'} via UPIQRPay payment {payment_id} (₹{paid_amount})."
+        )
+        pending_payments.pop(user_id, None)
         return True
     except Exception as e:
-        # Never allow an admin-notification failure to turn a completed payment
-        # back into a pending/retry loop.
-        try:
-            bot.send_message(ADMIN_ID, f"❌ Error during UPIQRPay auto-approval for user {user_id}, payment {payment_id}: {e}")
-        except Exception:
-            pass
-        pending_payments.pop(user_id, None)
+        bot.send_message(ADMIN_ID, f"❌ Error during UPIQRPay auto-approval for user {user_id}, payment {payment_id}: {e}")
         return False
     finally:
         with payment_lock:
@@ -1520,29 +1486,19 @@ def setname(call):
     bot.register_next_step_handler(msg, process_setname, ch_id)
 
 def process_setname(message, ch_id):
-    raw = capture_text_or_command(message)
-    if raw == "/cancel":
+    if message.text and message.text.strip() == "/cancel":
         bot.send_message(ADMIN_ID, "Cancelled — display name unchanged.")
         return
-    if raw == "/remove":
-        channels_col.update_one({"channel_id": ch_id}, {"$unset": {"display_name": "", "display_name_html": "", "display_name_plain": ""}})
+    if message.text and message.text.strip() == "/remove":
+        channels_col.update_one({"channel_id": ch_id}, {"$unset": {"display_name": ""}})
         bot.send_message(ADMIN_ID, "🗑 Display name removed. Users will now see the real channel name.")
         return
-    html_name, plain_name = capture_message_html(message)
-    if not html_name or not plain_name:
-        bot.send_message(ADMIN_ID, "❌ Please send a text message. Premium/custom emojis are supported automatically.")
+    if not message.text:
+        bot.send_message(ADMIN_ID, "❌ That wasn't text. Try again via /channels, or send /cancel.")
         return
-    try:
-        bot.send_message(ADMIN_ID, f"Preview: <b>{html_name}</b>", parse_mode="HTML")
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Could not process the channel name formatting/emoji: {e}")
-        return
-    channels_col.update_one({"channel_id": ch_id}, {"$set": {
-        "display_name": plain_name,
-        "display_name_plain": plain_name,
-        "display_name_html": html_name
-    }})
-    bot.send_message(ADMIN_ID, "✅ Channel display name updated! Premium emojis and formatting were captured automatically.")
+
+    channels_col.update_one({"channel_id": ch_id}, {"$set": {"display_name": message.text.strip()}})
+    bot.send_message(ADMIN_ID, f"✅ Display name set to \"{message.text.strip()}\". Users will see this instead of the real channel title.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('editplans_'))
 def editplans(call):
@@ -1563,71 +1519,43 @@ def editplans(call):
 
 def process_editplans(message, ch_id, ch_name):
     try:
-        raw_text = message.text or ""
-        if raw_text.strip() == "/cancel":
-            bot.send_message(ADMIN_ID, "Cancelled — plans unchanged.")
-            return
-        if raw_text.strip() == "/reset":
-            channels_col.update_one({"channel_id": ch_id}, {"$set": {"plans": {}}})
-            bot.send_message(ADMIN_ID, "✅ Plans cleared. Add them again from /channels.")
-            return
-        saved_html = apply_html_entities(raw_text, getattr(message, "entities", None))
-        raw_parts = raw_text.split(',')
-        html_parts = saved_html.split(',')
-        if len(raw_parts) != len(html_parts):
-            raise ValueError("Could not match plan entries")
+        raw_plans = message.text.split(',')
         plans_dict = {}
-        for raw_p, html_p in zip(raw_parts, html_parts):
-            parts = raw_p.strip().split(':', 2)
-            html_parts_one = html_p.strip().split(':', 2)
-            if len(parts) < 2 or len(html_parts_one) < 2:
-                raise ValueError("Missing price")
+        for p in raw_plans:
+            parts = p.strip().split(':', 2)
             t = parts[0].strip()
             t = t.lower() if t.lower() == "lifetime" else t
             pr = parts[1].strip()
             label = parts[2].strip() if len(parts) == 3 else None
-            label_html = html_parts_one[2].strip() if len(html_parts_one) == 3 else None
-            if label:
-                plans_dict[t] = {"price": pr, "label": label, "label_html": label_html or esc(label)}
-            else:
-                plans_dict[t] = pr
+            plans_dict[t] = {"price": pr, "label": label} if label else pr
 
         channels_col.update_one({"channel_id": ch_id}, {"$set": {"plans": plans_dict}})
-        bot.send_message(ADMIN_ID, f"✅ Plans updated for *{ch_name}*. Premium emojis in plan labels were captured automatically.", parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Invalid format. Use `Min:Price` or `Min:Price:Label`. Premium emojis can be selected normally in the Label.\n\nError: {e}", parse_mode="Markdown")
+        bot.send_message(ADMIN_ID, f"✅ Plans updated for *{ch_name}*.", parse_mode="Markdown")
+    except Exception:
+        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price` or `Min:Price:Label`. Try again via /channels.", parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('setdesc_'))
 def setdesc(call):
     bot.answer_callback_query(call.id)
     ch_id = int(call.data.split('_')[1])
     msg = bot.send_message(call.message.chat.id,
-        "📝 Send the channel details exactly as you want them shown.\n\n✨ Premium/custom emojis, bold, italic, links and blockquotes are captured automatically — just send them normally.\n\nSend /cancel to abort, or /remove to clear it.")
+        "📝 Send the channel details text you want shown to users (features, what's included, etc.) before they pick a plan.\n\nSend /cancel to abort, or /remove to clear it.")
     bot.register_next_step_handler(msg, process_setdesc, ch_id)
 
 def process_setdesc(message, ch_id):
-    raw = capture_text_or_command(message)
-    if raw == "/cancel":
+    if message.text and message.text.strip() == "/cancel":
         bot.send_message(ADMIN_ID, "Cancelled — channel details unchanged.")
         return
-    if raw == "/remove":
-        channels_col.update_one({"channel_id": ch_id}, {"$unset": {"description": "", "description_html": ""}})
+    if message.text and message.text.strip() == "/remove":
+        channels_col.update_one({"channel_id": ch_id}, {"$unset": {"description": ""}})
         bot.send_message(ADMIN_ID, "🗑 Channel details removed.")
         return
-    html_desc, plain_desc = capture_message_html(message)
-    if not html_desc:
-        bot.send_message(ADMIN_ID, "❌ Please send text. Premium/custom emojis and formatting are supported automatically.")
+    if not message.text:
+        bot.send_message(ADMIN_ID, "❌ That wasn't text. Try again via /channels, or send /cancel.")
         return
-    try:
-        bot.send_message(ADMIN_ID, html_desc, parse_mode="HTML")
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Could not process the channel details formatting/emoji: {e}")
-        return
-    channels_col.update_one({"channel_id": ch_id}, {"$set": {
-        "description": plain_desc,
-        "description_html": html_desc
-    }})
-    bot.send_message(ADMIN_ID, "✅ Channel details updated! Premium emojis and formatting were captured automatically.")
+
+    channels_col.update_one({"channel_id": ch_id}, {"$set": {"description": message.text}})
+    bot.send_message(ADMIN_ID, "✅ Channel details updated! It'll show the next time someone views this channel's plans.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('setchimg_'))
 def setchimg(call):
