@@ -155,6 +155,18 @@ def whole_rupee(amount):
     """Round a positive INR amount to the nearest whole rupee (half-up)."""
     return int(Decimal(str(amount)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
+def get_global_offer():
+    """Return the active all-user offer, or a zero-percent offer if disabled."""
+    setting = settings_col.find_one({"key": "global_offer"})
+    offer = setting.get("value", {}) if setting else {}
+    if not isinstance(offer, dict) or not offer.get("active"):
+        return 0
+    try:
+        percent = int(offer.get("percent", 0))
+    except (TypeError, ValueError):
+        return 0
+    return percent if 1 <= percent <= 99 else 0
+
 def plan_button_text(p_time, p_val):
     price, custom_label = plan_info(p_val)
     price = whole_rupee(price)
@@ -197,8 +209,8 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
             return
 
     markup = InlineKeyboardMarkup()
-    # Show this user's currently valid coupon discount in plan buttons, without
-    # modifying the original prices stored in MongoDB.
+    # Global offers apply automatically to every user. Coupons remain optional;
+    # discounts do not stack, and the larger available discount is displayed.
     active_coupon_code = coupon_sessions.get(user_id) if user_id is not None else None
     active_coupon = coupons_col.find_one({"code": active_coupon_code}) if active_coupon_code else None
     coupon_percent = 0
@@ -210,24 +222,26 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
                 and (max_uses is None or int(active_coupon.get("used_count", 0)) < int(max_uses))):
             coupon_percent = int(active_coupon.get("percent", 0))
         else:
-            coupon_sessions.pop(user_id, None)
+            if user_id is not None:
+                coupon_sessions.pop(user_id, None)
             active_coupon_code = None
+
+    global_offer_percent = get_global_offer()
+    effective_percent = max(global_offer_percent, coupon_percent)
 
     for p_time, p_val in ch_data['plans'].items():
         button_text = plan_button_text(p_time, p_val)
-        if coupon_percent:
-            original_price, custom_label = plan_info(p_val)
+        if effective_percent:
+            original_price, _ = plan_info(p_val)
             try:
                 original_price_num = float(original_price)
-                discounted_price = whole_rupee(original_price_num * (100 - coupon_percent) / 100)
-                if custom_label:
-                    duration_part = button_text.split(" - ₹", 1)[1] if " - ₹" in button_text else ""
-                    button_text = f"{custom_label} - ₹{discounted_price} (was ₹{original_price_num:g})"
-                    if duration_part and "(" in duration_part:
-                        button_text += f" ({duration_part.split('(', 1)[1]}"
-                else:
-                    # Keep the existing duration label and append the original price.
-                    button_text = button_text.replace(f"₹{original_price}", f"₹{discounted_price} (was ₹{original_price_num:g})", 1)
+                original_whole = whole_rupee(original_price_num)
+                discounted_price = whole_rupee(original_price_num * (100 - effective_percent) / 100)
+                button_text = button_text.replace(
+                    f"₹{original_whole}",
+                    f"₹{discounted_price} (was ₹{original_whole})",
+                    1
+                )
             except (TypeError, ValueError):
                 pass
         markup.add(InlineKeyboardButton(button_text, callback_data=f"select_{ch_id}_{p_time}"))
@@ -249,6 +263,12 @@ def show_plans(chat_id, ch_id, user_id=None, skip_active_check=False, force_new=
     else:
         caption = f"Welcome!\n\nYou are joining: <b>{disp_name_html(ch_data)}</b>.\n\nPlease select a subscription plan below:"
 
+    offer_percent_for_caption = get_global_offer()
+    if offer_percent_for_caption:
+        caption = caption.replace(
+            "Please select a subscription plan below:",
+            f"🔥 <b>GLOBAL OFFER: {offer_percent_for_caption}% OFF FOR EVERYONE</b> — no coupon code needed!\n\nPlease select a subscription plan below:"
+        )
     send_page(chat_id, caption, photo=ch_data.get('image'), reply_markup=markup, parse_mode="HTML", force_new=force_new)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('extendyes_'))
@@ -428,7 +448,7 @@ def help_handler(message):
     if message.from_user.id == ADMIN_ID:
         text = ("🤖 <b>Admin Commands:</b>\n\n"
                 "/start – Start the bot (same view as users)\n"
-                "/admin – Open Admin Panel (payments, revenue, users, coupons, channels, and more)\n"
+                "/admin – Open Admin Panel (payments, revenue, users, coupons, global offers, channels, and more)\n"
                 "/myplan – Check your plans\n"
                 "/help – Show this help")
     else:
@@ -555,6 +575,7 @@ def admin_panel(message):
     markup.add(InlineKeyboardButton("👥 Active Subscribers", callback_data="adm_active"))
     markup.add(InlineKeyboardButton("🔎 Search User", callback_data="adm_usersearch"))
     markup.add(InlineKeyboardButton("🎟️ Manage Coupons", callback_data="adm_coupons"))
+    markup.add(InlineKeyboardButton("🔥 Manage Global Offer", callback_data="adm_offer"))
     markup.add(InlineKeyboardButton("🎁 Manually Grant Access", callback_data="adm_grant"))
     markup.add(InlineKeyboardButton("🚫 Remove Membership", callback_data="adm_remove"))
     markup.add(InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast"))
@@ -751,6 +772,74 @@ def user_remove_membership(call):
         bot.send_message(uid, "⚠️ Your membership has been removed by the admin.")
     except Exception:
         pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_offer")
+def adm_offer(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Admin only", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    percent = get_global_offer()
+    status = f"ACTIVE — {percent}% off for every user" if percent else "OFF — no global offer is active"
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("➕ Set / Change Offer", callback_data="offer_set"))
+    if percent:
+        markup.add(InlineKeyboardButton("🛑 Turn Offer Off", callback_data="offer_off"))
+    bot.send_message(
+        call.message.chat.id,
+        f"🔥 <b>Global Offer</b>\n\nStatus: <b>{status}</b>\n\n"
+        "This offer applies automatically to all users. No coupon code is required. "
+        "It does not stack with coupons; the higher discount is used.",
+        parse_mode="HTML", reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "offer_set")
+def offer_set(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Admin only", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(
+        ADMIN_ID,
+        "🔥 Send the global discount percentage (1–99).\n\nExample: 50\n"
+        "This will apply to every user automatically; no coupon code is needed."
+    )
+    bot.register_next_step_handler(msg, process_offer_set)
+
+
+def process_offer_set(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    raw = (message.text or "").strip()
+    try:
+        percent = int(raw)
+        if not 1 <= percent <= 99:
+            raise ValueError
+    except (TypeError, ValueError):
+        bot.send_message(ADMIN_ID, "❌ Invalid percentage. Send a whole number from 1 to 99, or use /admin to try again.")
+        return
+    settings_col.update_one(
+        {"key": "global_offer"},
+        {"$set": {"value": {"active": True, "percent": percent, "updated_at": datetime.now()}}},
+        upsert=True
+    )
+    bot.send_message(ADMIN_ID, f"✅ Global offer activated: <b>{percent}% off for all users</b>. No coupon code required.", parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "offer_off")
+def offer_off(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Admin only", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    settings_col.update_one(
+        {"key": "global_offer"},
+        {"$set": {"value": {"active": False, "percent": 0, "updated_at": datetime.now()}}},
+        upsert=True
+    )
+    bot.send_message(ADMIN_ID, "🛑 Global offer turned off. Normal prices and any valid user coupons will apply.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_coupons")
@@ -1136,16 +1225,33 @@ def user_pays(call):
     price = float(price)
     coupon_code = coupon_sessions.get(call.from_user.id)
     coupon = coupons_col.find_one({"code": coupon_code}) if coupon_code else None
-    discount_percent = 0
+    coupon_percent = 0
     if coupon:
         expires_at = coupon.get("expires_at")
         max_uses = coupon.get("max_uses")
-        if coupon.get("active", True) is False or (expires_at and expires_at <= datetime.now()) or (max_uses is not None and int(coupon.get("used_count", 0)) >= int(max_uses)):
+        if (coupon.get("active", True) is False or (expires_at and expires_at <= datetime.now())
+                or (max_uses is not None and int(coupon.get("used_count", 0)) >= int(max_uses))):
             coupon = None
             coupon_code = None
             coupon_sessions.pop(call.from_user.id, None)
         else:
-            discount_percent = int(coupon.get("percent", 0))
+            coupon_percent = int(coupon.get("percent", 0))
+
+    global_offer_percent = get_global_offer()
+    if global_offer_percent >= coupon_percent and global_offer_percent > 0:
+        discount_percent = global_offer_percent
+        discount_source = "global_offer"
+        # Do not consume a coupon when the global offer is the one applied.
+        applied_coupon_code = None
+    elif coupon_percent > 0:
+        discount_percent = coupon_percent
+        discount_source = "coupon"
+        applied_coupon_code = coupon_code
+    else:
+        discount_percent = 0
+        discount_source = None
+        applied_coupon_code = None
+
     pay_amount = whole_rupee(price * (100 - discount_percent) / 100)
     order_id = f"TG_{call.from_user.id}_{uuid.uuid4().hex[:12]}"
 
@@ -1224,8 +1330,10 @@ def user_pays(call):
         plan_label = "Lifetime Membership" if str(mins).strip().lower() == "lifetime" else f"{mins} Minutes"
     price_display = f"₹{whole_rupee(price)}"
     amount_line = f"Price: {price_display}"
-    if discount_percent:
-        amount_line += f"\n🎟️ Coupon {coupon_code}: -{discount_percent}%"
+    if discount_source == "global_offer":
+        amount_line += f"\n🔥 Global offer: -{discount_percent}% (automatic)"
+    elif discount_source == "coupon":
+        amount_line += f"\n🎟️ Coupon {applied_coupon_code}: -{discount_percent}%"
     amount_line += f"\n💰 Pay: ₹{pay_amount:.2f}" if gateway_adjustment else f"\n💰 Pay: ₹{pay_amount}"
     if gateway_adjustment:
         amount_line += f"\nℹ️ Gateway adjustment: +₹{gateway_adjustment:.2f}"
@@ -1256,8 +1364,9 @@ def user_pays(call):
         "mins": mins,
         "price": price,
         "pay_amount": pay_amount,
-        "coupon_code": coupon_code,
+        "coupon_code": applied_coupon_code,
         "discount_percent": discount_percent,
+        "discount_source": discount_source,
         "payment_id": payment_id,
         "order_id": payment.get("order_id", order_id),
     }
