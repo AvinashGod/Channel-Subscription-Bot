@@ -579,6 +579,7 @@ def admin_panel(message):
     markup.add(InlineKeyboardButton("🎁 Manually Grant Access", callback_data="adm_grant"))
     markup.add(InlineKeyboardButton("🚫 Remove Membership", callback_data="adm_remove"))
     markup.add(InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast"))
+    markup.add(InlineKeyboardButton("✉️ Send Message to User", callback_data="adm_senduser"))
     markup.add(InlineKeyboardButton("📋 Manage Channels", callback_data="adm_channels"))
     markup.add(InlineKeyboardButton("✏️ Edit Start Message", callback_data="adm_editstart"))
     markup.add(InlineKeyboardButton("✏️ Edit Channel List Message", callback_data="adm_editchmsg"))
@@ -918,6 +919,68 @@ def do_broadcast(message):
         except Exception:
             failed += 1
     bot.send_message(ADMIN_ID, f"📢 Broadcast complete.\n\nSent: {sent}\nFailed (blocked/inactive): {failed}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_senduser")
+def adm_senduser(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Not authorized.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(
+        call.message.chat.id,
+        "✉️ <b>Send a message to one user</b>\n\n"
+        "Send the user's Telegram ID.\n"
+        "Send /cancel to abort.",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, process_specific_user_id)
+
+
+def process_specific_user_id(message):
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        bot.send_message(ADMIN_ID, "Message to user cancelled.")
+        return
+    try:
+        target_id = int(raw)
+        if target_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        msg = bot.send_message(ADMIN_ID, "❌ Invalid Telegram user ID. Send a numeric user ID, or /cancel.")
+        bot.register_next_step_handler(msg, process_specific_user_id)
+        return
+
+    msg = bot.send_message(
+        ADMIN_ID,
+        f"Recipient: <code>{target_id}</code>\n\n"
+        "Now send the message you want delivered. Text, photo, video, document and other Telegram message types can be copied.\n"
+        "Send /cancel to abort.",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, process_specific_user_message, target_id)
+
+
+def process_specific_user_message(message, target_id):
+    if message.text and message.text.strip().lower() == "/cancel":
+        bot.send_message(ADMIN_ID, "Message to user cancelled.")
+        return
+    try:
+        bot.copy_message(
+            chat_id=target_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
+        bot.send_message(ADMIN_ID, f"✅ Message successfully sent to user <code>{target_id}</code>.", parse_mode="HTML")
+    except Exception as e:
+        # Do not expose internal credentials or API details; report the Telegram error to admin.
+        bot.send_message(
+            ADMIN_ID,
+            f"❌ Could not send the message to user <code>{target_id}</code>.\n"
+            "The user may not have started the bot, may have blocked it, or the ID may be incorrect.\n\n"
+            f"Error: {esc(e)}",
+            parse_mode="HTML"
+        )
 
 @bot.callback_query_handler(func=lambda call: call.data == "adm_grant")
 def adm_grant(call):
